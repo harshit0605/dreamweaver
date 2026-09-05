@@ -33,3 +33,16 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["deep", "viMax_port", "viMax_port.tests"]
 py-modules = ["agent", "linear_agent", "server", "script_ingest_routes"]
+
+[tool.pytest.ini_options]
+# M9.5 — pytest markers for the test pyramid layers.
+#
+# Default `pytest tests/` runs unmarked + integration tests (the
+# integration suite takes milliseconds because the LLM is mocked).
+# Live-LLM smoke tests are gated behind `@pytest.mark.llm` and only
+# run when explicitly invoked with `-m llm`. CI runs `-m "not llm"`;
+# the nightly cron runs `-m llm`.
+markers = [
+  "integration: L4 — Python LangGraph integration tests with mocked LLM + Convex shim.",
+  "llm: L5 — live-LLM smoke tests against a real model. Skipped in CI; nightly cron runs them.",
+]

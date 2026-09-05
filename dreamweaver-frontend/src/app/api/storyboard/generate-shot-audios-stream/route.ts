@@ -16,6 +16,11 @@ import { ConvexHttpClient } from "convex/browser";
 import type { Id } from "../../../../../convex/_generated/dataModel";
 import { getToken } from "@/lib/auth-server";
 import { mutationRef, queryRef } from "@/lib/convexRefs";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
 import { sseFrame } from "@/lib/ingest-postprocess";
 import { createLogger, resolveRequestId } from "@/lib/observability";
 import {
@@ -23,6 +28,10 @@ import {
   extractDialogue,
   type SpeakerVoiceMap,
 } from "@/lib/dialogue-extract";
+import {
+  buildDialogueMixArgs,
+  buildMixPlan,
+} from "@/lib/dialogue-mix";
 import type { NodeType } from "@/app/storyboard/types";
 
 export const runtime = "nodejs";
@@ -44,6 +53,13 @@ interface GenerateShotAudiosBody {
   voice?: string;
   model?: string;
   speed?: number;
+  /** M8 — when set, translates each shot's narration into the target
+   *  locale before TTS and stores the dubbed mp3 in
+   *  `localeNarrations` instead of attaching it as the shot's
+   *  active narration. Source-language ("", "en", "en-*") runs the
+   *  original path: translate skipped, asset attached via
+   *  `activeAudioId`. */
+  locale?: string;
 }
 
 interface SnapshotNode {
@@ -105,6 +121,49 @@ export const deriveShotNarrationText = (
   return null;
 };
 
+/**
+ * Does `ffmpeg` exist on PATH? Determines whether multi-speaker mixing
+ * is possible on this host. Memoized per-process because the answer
+ * can't change between requests without a restart.
+ */
+let _ffmpegPresent: boolean | null = null;
+const ffmpegAvailable = (): Promise<boolean> => {
+  if (_ffmpegPresent !== null) return Promise.resolve(_ffmpegPresent);
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn("ffmpeg", ["-version"], { stdio: "ignore" });
+      proc.on("error", () => {
+        _ffmpegPresent = false;
+        resolve(false);
+      });
+      proc.on("close", (code) => {
+        _ffmpegPresent = code === 0;
+        resolve(_ffmpegPresent);
+      });
+    } catch {
+      _ffmpegPresent = false;
+      resolve(false);
+    }
+  });
+};
+
+/** Spawn ffmpeg, resolve on exit 0, reject on non-zero with last 2KB
+ *  of stderr attached. Tight wrapper around child_process.spawn. */
+const runFfmpeg = (args: string[]): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 2048) stderr = stderr.slice(-2048);
+    });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-800)}`));
+    });
+  });
+
 export async function POST(request: NextRequest): Promise<Response> {
   const requestId = resolveRequestId(request.headers);
   const log = createLogger({
@@ -157,6 +216,12 @@ export async function POST(request: NextRequest): Promise<Response> {
   const voice = (body.voice ?? DEFAULT_VOICE).trim() || DEFAULT_VOICE;
   const model = (body.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
   const speed = typeof body.speed === "number" ? body.speed : 1.0;
+  const localeRaw = (body.locale ?? "").trim();
+  // Import lazily — `isSourceLocale` pulls in the whole subtitles lib;
+  // no need to bundle it for source-only audio batches.
+  const { isSourceLocale } = await import("@/lib/subtitles");
+  const willDub = !isSourceLocale(localeRaw);
+  const locale = willDub ? localeRaw : "";
 
   const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
   if (!convexUrl) {
@@ -229,6 +294,13 @@ export async function POST(request: NextRequest): Promise<Response> {
         // or the pack name — cover both so manual + ingested packs
         // both resolve.
         const speakerVoices: SpeakerVoiceMap = {};
+        // M8 — parallel map of UPPERCASE speaker → ElevenLabs voice
+        // clone id. When a shot's speaker resolves to a clone, the
+        // TTS call routes through ElevenLabs instead of OpenAI
+        // (falling back to the preset voice if the clone provider
+        // errors). Lookup uses the same key vocabulary as
+        // `speakerVoices` so the two maps align naturally.
+        const speakerClones: Record<string, string> = {};
         const allowedVoices = new Set([
           "alloy",
           "echo",
@@ -237,9 +309,30 @@ export async function POST(request: NextRequest): Promise<Response> {
           "nova",
           "shimmer",
         ]);
+        // Fetch clone rows up-front — small table per producer,
+        // one round-trip, reused across every shot.
+        let clonesById = new Map<string, string>();
+        try {
+          const clones = (await client.query(
+            queryRef("voiceClones:listVoiceClones"),
+            {},
+          )) as Array<{ _id: string; elevenlabsVoiceId: string }> | undefined;
+          for (const clone of clones ?? []) {
+            clonesById.set(clone._id, clone.elevenlabsVoiceId);
+          }
+        } catch {
+          // Non-fatal — clones are optional. Fall through to the
+          // preset-voice path.
+          clonesById = new Map();
+        }
         for (const pack of constraintBundle?.identityPacks ?? []) {
           const packVoice = typeof pack.voice === "string" ? pack.voice : "";
-          if (!packVoice || !allowedVoices.has(packVoice)) continue;
+          const hasPresetVoice =
+            packVoice.length > 0 && allowedVoices.has(packVoice);
+          const cloneRef =
+            typeof pack.voiceCloneId === "string" ? pack.voiceCloneId : "";
+          const cloneElevenId = cloneRef ? clonesById.get(cloneRef) : undefined;
+          if (!hasPresetVoice && !cloneElevenId) continue;
           const sourceId =
             typeof pack.sourceCharacterId === "string"
               ? pack.sourceCharacterId
@@ -247,12 +340,19 @@ export async function POST(request: NextRequest): Promise<Response> {
           const name = typeof pack.name === "string" ? pack.name : "";
           for (const candidate of [sourceId, name]) {
             const key = candidate.trim().toUpperCase();
-            if (key.length > 0) speakerVoices[key] = packVoice;
+            if (key.length === 0) continue;
+            if (hasPresetVoice) speakerVoices[key] = packVoice;
+            if (cloneElevenId) speakerClones[key] = cloneElevenId;
           }
         }
 
         const shots = snapshot.nodes.filter((n) => n.nodeType === "shot");
         const total = shots.length;
+        // Check once whether ffmpeg is available so the worker can
+        // decide between single-voice TTS and multi-speaker concat.
+        // Absent ffmpeg → multi-speaker shots gracefully fall back to
+        // the first-line single-voice path (no crash, just degraded).
+        const canMixDialogue = await ffmpegAvailable();
         send("open", {
           total,
           concurrency,
@@ -260,6 +360,7 @@ export async function POST(request: NextRequest): Promise<Response> {
           voice,
           model,
           voiceAssignments: Object.keys(speakerVoices).length,
+          canMixDialogue,
         });
         log.info("shot_audio_batch_started", {
           storyboardId,
@@ -267,6 +368,7 @@ export async function POST(request: NextRequest): Promise<Response> {
           concurrency,
           voice,
           model,
+          canMixDialogue,
         });
 
         const counts = { succeeded: 0, failed: 0, skipped: 0 };
@@ -289,18 +391,204 @@ export async function POST(request: NextRequest): Promise<Response> {
               continue;
             }
 
-            // M6 speaker-aware routing: decide whether this shot has a
-            // single dominant speaker with an assigned voice. When yes
-            // AND the dialogue is "solo" (no competing narration prose),
-            // feed only the dialogue text to TTS in the speaker's voice
-            // — much cleaner than reading the whole segment.
+            // M6 speaker-aware routing + M6 voice #1 multi-speaker mix.
             const segmentText = shot.segment ?? "";
             const decision = decidePrimarySpeaker(segmentText, speakerVoices);
+            const extracted = extractDialogue(segmentText);
+            const attributedLines = extracted.lines.filter(
+              (l) => l.speaker !== null,
+            );
+            const uniqueSpeakers = new Set(
+              attributedLines
+                .map((l) => (l.speaker ?? "").toUpperCase())
+                .filter((s) => s.length > 0),
+            );
+
+            // Multi-speaker path: 2+ distinct speakers AND ffmpeg on the
+            // host. Each line renders in its own voice and we concat
+            // them with a short silence gap. Any failure here falls
+            // through to the single-voice path below.
+            const mixPlan =
+              canMixDialogue && uniqueSpeakers.size >= 2
+                ? buildMixPlan({
+                    lines: extracted.lines,
+                    speakerVoices,
+                    defaultVoice: voice,
+                  })
+                : null;
+            if (mixPlan && mixPlan.length >= 2) {
+              send("shot_started", {
+                nodeId,
+                index,
+                total,
+                mode: "multi_speaker_mix",
+                speakerCount: uniqueSpeakers.size,
+                lineCount: mixPlan.length,
+              });
+              let mediaAssetId: Id<"mediaAssets"> | null = null;
+              const shotWorkDir = joinPath(
+                tmpdir(),
+                `audio-mix-${randomUUID()}`,
+              );
+              try {
+                mediaAssetId = (await client.mutation(
+                  mutationRef("mediaAssets:startMediaGeneration"),
+                  {
+                    storyboardId: storyboardId as Id<"storyboards">,
+                    nodeId,
+                    kind: "audio" as const,
+                    modelId: `${model}+mix`,
+                    prompt: mixPlan.map((l) => l.text).join(" | "),
+                  },
+                )) as Id<"mediaAssets">;
+
+                await mkdir(shotWorkDir, { recursive: true });
+
+                // 1. Per-line TTS — call /api/media/generate-audio which
+                //    handles OpenAI + Convex storage upload, then
+                //    download the resulting URL to disk. M8: resolve
+                //    clone ids per-line so each speaker with an
+                //    attached voice clone renders through ElevenLabs.
+                const linePaths: string[] = [];
+                for (const line of mixPlan) {
+                  const cloneIdForLine = line.speaker
+                    ? speakerClones[line.speaker]
+                    : undefined;
+                  const res = await fetch(
+                    `${origin}/api/media/generate-audio`,
+                    {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+                      },
+                      body: JSON.stringify({
+                        text: line.text,
+                        voice: line.voice,
+                        model,
+                        speed,
+                        elevenlabsVoiceId: cloneIdForLine,
+                      }),
+                    },
+                  );
+                  if (!res.ok) {
+                    const bodyText = await res.text().catch(() => "");
+                    throw new Error(
+                      `line ${line.index} TTS ${res.status}: ${bodyText.slice(0, 200)}`,
+                    );
+                  }
+                  const data = (await res.json()) as { url?: string };
+                  if (!data.url) throw new Error(`line ${line.index} TTS returned no url`);
+                  const dl = await fetch(data.url);
+                  if (!dl.ok) throw new Error(`line ${line.index} download ${dl.status}`);
+                  const localPath = joinPath(
+                    shotWorkDir,
+                    `line_${line.index}.mp3`,
+                  );
+                  await writeFile(
+                    localPath,
+                    Buffer.from(await dl.arrayBuffer()),
+                  );
+                  linePaths.push(localPath);
+                }
+
+                // 2. Single filter_complex pass: normalize every line to
+                //    a canonical 44.1kHz mono shape, pad inter-line gaps
+                //    with apad, concat. One ffmpeg invocation, no
+                //    shape-mismatch surprises if a TTS provider ever
+                //    emits something other than 24kHz mono.
+                const mixPath = joinPath(shotWorkDir, "mix.mp3");
+                await runFfmpeg(
+                  buildDialogueMixArgs(linePaths, mixPath),
+                );
+
+                // 3. Upload to Convex storage (same path the cameo +
+                //    single-voice TTS uploads use).
+                const uploadUrl = (await client.mutation(
+                  mutationRef("storage:generateCameoUploadUrl"),
+                  {},
+                )) as string;
+                const { readFile } = await import("node:fs/promises");
+                const mixBytes = await readFile(mixPath);
+                const mixArrayBuffer = new ArrayBuffer(mixBytes.byteLength);
+                new Uint8Array(mixArrayBuffer).set(mixBytes);
+                const uploadRes = await fetch(uploadUrl, {
+                  method: "POST",
+                  headers: { "Content-Type": "audio/mpeg" },
+                  body: new Blob([mixArrayBuffer], { type: "audio/mpeg" }),
+                });
+                if (!uploadRes.ok) {
+                  const bodyText = await uploadRes.text().catch(() => "");
+                  throw new Error(
+                    `mix upload ${uploadRes.status}: ${bodyText.slice(0, 200)}`,
+                  );
+                }
+                const { storageId } = (await uploadRes.json()) as {
+                  storageId: string;
+                };
+                const publicUrl = (await client.mutation(
+                  mutationRef("storage:getStorageUrl"),
+                  { storageId: storageId as never },
+                )) as string;
+
+                await client.mutation(
+                  mutationRef("mediaAssets:completeMediaGeneration"),
+                  { mediaAssetId, sourceUrl: publicUrl, modelId: `${model}+mix` },
+                );
+                counts.succeeded += 1;
+                send("shot_succeeded", {
+                  nodeId,
+                  index,
+                  sourceUrl: publicUrl,
+                  modelId: `${model}+mix`,
+                  mode: "multi_speaker_mix",
+                  speakerCount: uniqueSpeakers.size,
+                  lineCount: mixPlan.length,
+                });
+                await rm(shotWorkDir, {
+                  recursive: true,
+                  force: true,
+                }).catch(() => undefined);
+                continue;
+              } catch (err) {
+                const msg =
+                  err instanceof Error
+                    ? err.message
+                    : "multi-speaker mix failed";
+                log.warn("multi_speaker_mix_failed", {
+                  nodeId,
+                  error: msg,
+                });
+                if (mediaAssetId) {
+                  try {
+                    await client.mutation(
+                      mutationRef("mediaAssets:failMediaGeneration"),
+                      { mediaAssetId, errorMessage: msg.slice(0, 500) },
+                    );
+                  } catch {
+                    // sweeper will clean
+                  }
+                }
+                await rm(shotWorkDir, {
+                  recursive: true,
+                  force: true,
+                }).catch(() => undefined);
+                counts.failed += 1;
+                send("shot_failed", {
+                  nodeId,
+                  index,
+                  error: msg,
+                  mode: "multi_speaker_mix",
+                });
+                continue;
+              }
+            }
+
+            // Single-voice path (fallback when 0-1 speakers or no ffmpeg).
             let effectiveVoice = voice;
             let text: string | null;
             if (decision.speaker && decision.voice && decision.isSoloDialogue) {
               effectiveVoice = decision.voice;
-              const extracted = extractDialogue(segmentText);
               const dialogueOnly = extracted.lines
                 .filter((l) => l.speaker === decision.speaker)
                 .map((l) => l.text)
@@ -328,12 +616,48 @@ export async function POST(request: NextRequest): Promise<Response> {
               continue;
             }
 
+            // M8 — optional translation before TTS. One LLM call per
+            // shot (the translator's `batchSize` cap would help a
+            // bigger pipeline, but per-shot calls here make the SSE
+            // progress granular; batching would delay the first
+            // `shot_started` frame). Cache hits on repeat locales are
+            // handled by the subtitles route, not here — the narration
+            // pipeline uses the LLM directly to keep its stream
+            // responsive.
+            if (willDub) {
+              try {
+                const { openAiTranslateBatch } = await import(
+                  "@/lib/subtitles"
+                );
+                const [translated] = await openAiTranslateBatch(
+                  [text],
+                  locale,
+                );
+                if (typeof translated === "string" && translated.length > 0) {
+                  text = translated;
+                }
+              } catch (err) {
+                // Non-fatal: fall back to the source text so the
+                // producer still gets audio (in English) for this
+                // shot. Next producer-requested run for the same
+                // locale can retry.
+                const msg =
+                  err instanceof Error ? err.message : String(err);
+                log.warn("translate_failed_fallback_source", {
+                  nodeId,
+                  locale,
+                  error: msg,
+                });
+              }
+            }
+
             send("shot_started", {
               nodeId,
               index,
               total,
               speaker: decision.speaker,
               voice: effectiveVoice,
+              locale: willDub ? locale : undefined,
             });
 
             let mediaAssetId: Id<"mediaAssets"> | null = null;
@@ -359,6 +683,12 @@ export async function POST(request: NextRequest): Promise<Response> {
             }
 
             let generatedUrl: string | null = null;
+            // M8 — pick the ElevenLabs clone for the chosen speaker,
+            // if any. Narrator-only shots (decision.speaker === null)
+            // never pick a clone — narrators go through OpenAI.
+            const cloneIdForShot = decision.speaker
+              ? speakerClones[decision.speaker]
+              : undefined;
             try {
               const abort = new AbortController();
               const timer = setTimeout(() => abort.abort(), PER_SHOT_TIMEOUT_MS);
@@ -374,6 +704,7 @@ export async function POST(request: NextRequest): Promise<Response> {
                     voice: effectiveVoice,
                     model,
                     speed,
+                    elevenlabsVoiceId: cloneIdForShot,
                   }),
                   signal: abort.signal,
                 });
@@ -415,6 +746,11 @@ export async function POST(request: NextRequest): Promise<Response> {
                 {
                   mediaAssetId,
                   sourceUrl: generatedUrl,
+                  // Dubs must NOT replace the source-language
+                  // activeAudioId — they're linked through the
+                  // localeNarrations table and picked up at reel-
+                  // export time based on the requested locale.
+                  ...(willDub ? { skipNodePatch: true } : {}),
                 },
               );
             } catch (err) {
@@ -427,6 +763,40 @@ export async function POST(request: NextRequest): Promise<Response> {
               continue;
             }
 
+            // M8 — dubbed shots register into the per-locale table so
+            // the reel manifest can resolve the right narration per
+            // locale without every shot carrying its own `audios` map.
+            if (willDub) {
+              try {
+                await client.mutation(
+                  mutationRef(
+                    "localeNarrations:upsertLocaleNarration",
+                  ),
+                  {
+                    storyboardId: storyboardId as Id<"storyboards">,
+                    nodeId,
+                    locale,
+                    mediaAssetId,
+                    translatedText: text,
+                  },
+                );
+              } catch (err) {
+                // Asset is already persisted; upsert failure means
+                // the dub is orphaned but not broken. Surface via
+                // `shot_failed` so the producer can retry.
+                counts.failed += 1;
+                send("shot_failed", {
+                  nodeId,
+                  index,
+                  error:
+                    err instanceof Error
+                      ? `upsertLocaleNarration: ${err.message}`
+                      : "upsertLocaleNarration failed",
+                });
+                continue;
+              }
+            }
+
             counts.succeeded += 1;
             send("shot_succeeded", {
               nodeId,
@@ -435,6 +805,7 @@ export async function POST(request: NextRequest): Promise<Response> {
               modelId: model,
               speaker: decision.speaker,
               voice: effectiveVoice,
+              locale: willDub ? locale : undefined,
             });
           }
         };

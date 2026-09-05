@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  buildBurnInSubtitlesArgs,
   buildConcatArgs,
   buildConcatListFile,
   buildShotNormalizeArgs,
@@ -165,6 +166,8 @@ describe("planShotDownloads", () => {
       videoUrl: string | null;
       imageUrl: string | null;
       audioUrl: string | null;
+      sfxUrl: string | null;
+      sfxVolumeDb: number | null;
     }>,
   ) => ({
     nodeId: "n",
@@ -175,6 +178,8 @@ describe("planShotDownloads", () => {
     videoUrl: null as string | null,
     imageUrl: null as string | null,
     audioUrl: null as string | null,
+    sfxUrl: null as string | null,
+    sfxVolumeDb: null as number | null,
     prompt: null as string | null,
     ...overrides,
   });
@@ -233,5 +238,138 @@ describe("planShotDownloads", () => {
       "image",
       "silent_black",
     ]);
+  });
+
+  it("marks willDownloadSfx when the shot has an SFX url and isn't silent_black", () => {
+    const plans = planShotDownloads([
+      mkShot({ videoUrl: "v", audioUrl: "a", sfxUrl: "sfx" }),
+      mkShot({ imageUrl: "i", sfxUrl: "sfx" }),
+      mkShot({ videoUrl: "v" }), // no sfx → false
+      mkShot({ sfxUrl: "sfx" }), // silent_black + sfx → sfx skipped
+    ]);
+    expect(plans.map((p) => p.willDownloadSfx)).toEqual([
+      true,
+      true,
+      false,
+      false,
+    ]);
+  });
+});
+
+describe("buildBurnInSubtitlesArgs", () => {
+  it("runs the subtitles filter with -vf and copies audio", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+    });
+    expect(args).toContain("-vf");
+    const vfIdx = args.indexOf("-vf");
+    expect(args[vfIdx + 1]).toContain("subtitles=");
+    // audio stream must pass through unchanged — burn-in only touches video.
+    const cIdx = args.findIndex(
+      (v, i) => v === "-c:a" && args[i + 1] === "copy",
+    );
+    expect(cIdx).toBeGreaterThan(-1);
+    // faststart so the mp4 plays back while downloading (same pattern as
+    // the concat pass).
+    expect(args).toContain("+faststart");
+    expect(args[args.length - 1]).toBe("/tmp/reel.mp4");
+  });
+
+  it("escapes single quotes in the subtitle path", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/ed's/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    // The embedded quote must be escaped for ffmpeg's filter-graph parser.
+    expect(filter).toContain("ed\\'s");
+  });
+
+  it("escapes colons in the subtitle path (Windows drive letters, etc.)", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "C:/tmp/reel.concat.mp4",
+      subtitlePath: "C:/tmp/captions.srt",
+      outputPath: "C:/tmp/reel.mp4",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    // Colon inside a filter value splits args unless escaped.
+    expect(filter).toContain("C\\:");
+  });
+
+  it("appends :force_style=... when style is provided", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      forceStyle: "FontSize=28,Alignment=5",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    expect(filter).toContain(":force_style=");
+    expect(filter).toContain("FontSize=28");
+    expect(filter).toContain("Alignment=5");
+  });
+
+  it("omits force_style when the string is empty or whitespace", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      forceStyle: "   ",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    expect(filter).not.toContain("force_style");
+  });
+
+  it("escapes single quotes inside the force_style string", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      forceStyle: "FontName=ed's font",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    expect(filter).toContain("ed\\'s");
+  });
+
+  it("appends :fontsdir=... when a fontsDir is provided", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      fontsDir: "/opt/fonts",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    expect(filter).toContain(":fontsdir='/opt/fonts'");
+  });
+
+  it("omits fontsdir when unset or blank", () => {
+    const blank = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      fontsDir: "   ",
+    });
+    const blankFilter = blank[blank.indexOf("-vf") + 1];
+    expect(blankFilter).not.toContain("fontsdir");
+    const unset = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+    });
+    expect(unset[unset.indexOf("-vf") + 1]).not.toContain("fontsdir");
+  });
+
+  it("escapes colons inside the fontsDir path (Windows drive letters)", () => {
+    const args = buildBurnInSubtitlesArgs({
+      videoPath: "/tmp/reel.concat.mp4",
+      subtitlePath: "/tmp/captions.srt",
+      outputPath: "/tmp/reel.mp4",
+      fontsDir: "C:/fonts",
+    });
+    const filter = args[args.indexOf("-vf") + 1];
+    expect(filter).toContain("fontsdir='C\\:/fonts'");
   });
 });

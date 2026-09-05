@@ -182,6 +182,165 @@ export type ExportReelInput = {
   estimatedDurationS: number;
 };
 
+export type GenerateScoreInput = {
+  storyboardId: string;
+  prompt: string;
+  durationS: number;
+  volumeDb: number;
+  rationale: string;
+};
+
+export type DailiesCriticReviewInput = {
+  storyboardId: string;
+  dailiesReelId: string;
+  rationale: string;
+};
+
+export type BeatAssignmentEntry = {
+  nodeId: string;
+  beatKey: string;
+  actNumber?: number;
+  rationale?: string;
+};
+
+export type BeatAssignmentInput = {
+  storyboardId: string;
+  branchId: string;
+  structure: string;
+  assignments: BeatAssignmentEntry[];
+  assignmentCount: number;
+  overrideExisting: boolean;
+  rationale: string;
+};
+
+export type ShotSfxBatchInput = {
+  storyboardId: string;
+  branchId: string;
+  nodeCount: number;
+  rationale: string;
+  skipExisting: boolean;
+  concurrency: number;
+};
+
+// M9 Phase 3 — variant generation (cold-open hooks + structural remix).
+// Every variant becomes its own narrative-git branch on approve: the
+// handler calls narrativeGit:createBranch, commits the variant's
+// planOps via narrativeGit:commitPlanOps, then records the variant
+// metadata via narrativeState:upsertVariant so the Variant Compare tab
+// can enumerate candidates.
+// Matches convex/narrativeGit.ts `executionOperation` shape — every
+// field the Convex validator will accept on commitPlanOps. The parser
+// passes through known fields verbatim; the Convex validator remains
+// the source of truth so field drift between bridge + backend fails
+// loudly rather than silently dropping data.
+export type HookVariantPlanOp = {
+  op:
+    | "create_node"
+    | "update_node"
+    | "delete_node"
+    | "create_edge"
+    | "update_edge"
+    | "delete_edge";
+  opId?: string;
+  title: string;
+  rationale?: string;
+  nodeId?: string;
+  edgeId?: string;
+  nodeType?:
+    | "scene"
+    | "shot"
+    | "branch"
+    | "merge"
+    | "character_ref"
+    | "background_ref";
+  label?: string;
+  segment?: string;
+  position?: { x: number; y: number };
+  sourceNodeId?: string;
+  targetNodeId?: string;
+  edgeType?: "serial" | "parallel" | "branch" | "merge";
+  branchId?: string;
+  order?: number;
+  isPrimary?: boolean;
+};
+
+export type HookVariantEntry = {
+  variantId: string;
+  rationale: string;
+  expectedRetention: string;
+  branchName: string;
+  planOps: HookVariantPlanOp[];
+};
+
+export type HookVariantInput = {
+  storyboardId: string;
+  parentBranchId: string;
+  variants: HookVariantEntry[];
+  variantCount: number;
+  rationale: string;
+};
+
+export type StructuralRemixEntry = {
+  variantId: string;
+  rationale: string;
+  strategy: string;
+  branchName: string;
+  planOps: HookVariantPlanOp[];
+};
+
+export type StructuralRemixInput = {
+  storyboardId: string;
+  parentBranchId: string;
+  targetStructure: string;
+  variants: StructuralRemixEntry[];
+  variantCount: number;
+  rationale: string;
+};
+
+// M9 Phase 4 — transitions + motifs.
+export type TransitionProposalEntry = {
+  intent: string;
+  rawIntent?: string;
+  rationale?: string;
+  sharedElement?: string;
+  planOps?: HookVariantPlanOp[];
+  rank?: number;
+};
+
+export type TransitionProposalInput = {
+  storyboardId: string;
+  branchId: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+  proposals: TransitionProposalEntry[];
+  proposalCount: number;
+  rationale: string;
+};
+
+export type MotifPlantInput = {
+  storyboardId: string;
+  branchId: string;
+  motifKey: string;
+  targetNodeId: string;
+  description: string;
+  visualVocabulary: string;
+  sourceNodeIds: string[];
+  payoffNodeIds: string[];
+  planOps: HookVariantPlanOp[];
+  rationale: string;
+};
+
+export type VoiceCastAssignment = {
+  packId: string;
+  voice: string;
+};
+
+export type AssignVoiceCastInput = {
+  storyboardId: string;
+  assignments: VoiceCastAssignment[];
+  rationale: string;
+};
+
 /**
  * CustomEvent name the bridge dispatches to kick off the batch button. The
  * `GenerateAllShotsButton` listens for this on `window` so the agent doesn't
@@ -241,6 +400,34 @@ const dispatchShotVideoBatchTrigger = (
  */
 export const SHOT_AUDIO_BATCH_TRIGGER_EVENT =
   "storyboard:generate-shot-audio-batch";
+
+/**
+ * M7 — ambient/foley SFX batch trigger. Mirrors the audio batch event
+ * so `GenerateAllSfxsButton` can subscribe once and drive both
+ * producer-initiated + agent-initiated SFX runs.
+ */
+export const SHOT_SFX_BATCH_TRIGGER_EVENT =
+  "storyboard:generate-shot-sfx-batch";
+
+export type ShotSfxBatchTriggerDetail = {
+  storyboardId: string;
+  skipExisting: boolean;
+  concurrency: number;
+};
+
+const dispatchShotSfxBatchTrigger = (
+  detail: ShotSfxBatchTriggerDetail,
+): void => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.dispatchEvent(
+    new CustomEvent<ShotSfxBatchTriggerDetail>(
+      SHOT_SFX_BATCH_TRIGGER_EVENT,
+      { detail },
+    ),
+  );
+};
 
 export type ShotAudioBatchTriggerDetail = {
   storyboardId: string;
@@ -380,6 +567,464 @@ const parseGenerateShotVideoBatchInput = (
   };
 };
 
+const parseGenerateScoreInput = (
+  value: unknown,
+): GenerateScoreInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const prompt =
+    typeof value.prompt === "string" ? value.prompt.trim() : "";
+  if (!prompt) return null;
+  const durationRaw =
+    typeof value.durationS === "number" && Number.isFinite(value.durationS)
+      ? Math.floor(value.durationS)
+      : 60;
+  // Mirror lib/score clamps so the bridge rejects nonsense before the
+  // route sees it.
+  const durationS = Math.max(10, Math.min(300, durationRaw));
+  const volumeRaw =
+    typeof value.volumeDb === "number" && Number.isFinite(value.volumeDb)
+      ? Math.floor(value.volumeDb)
+      : -18;
+  const volumeDb = Math.max(-40, Math.min(0, volumeRaw));
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  return { storyboardId, prompt, durationS, volumeDb, rationale };
+};
+
+const parseDailiesCriticReviewInput = (
+  value: unknown,
+): DailiesCriticReviewInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  const dailiesReelId =
+    typeof value.dailiesReelId === "string" ? value.dailiesReelId : "";
+  if (!storyboardId || !dailiesReelId) return null;
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  return { storyboardId, dailiesReelId, rationale };
+};
+
+const parseBeatAssignmentInput = (
+  value: unknown,
+): BeatAssignmentInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const branchId =
+    typeof value.branchId === "string" && value.branchId.length > 0
+      ? value.branchId
+      : "main";
+  const structureRaw =
+    typeof value.structure === "string" ? value.structure : "";
+  // Mirror the Python tool's fallback: unknown structures collapse to
+  // save_the_cat so the producer always sees a valid roster in the
+  // approval card.
+  const structure = VALID_STRUCTURES.has(structureRaw)
+    ? structureRaw
+    : "save_the_cat";
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  const overrideExisting =
+    typeof value.overrideExisting === "boolean"
+      ? value.overrideExisting
+      : false;
+  const rawAssignments = Array.isArray(value.assignments)
+    ? value.assignments
+    : [];
+  const assignments: BeatAssignmentEntry[] = [];
+  for (const raw of rawAssignments) {
+    if (!isRecord(raw)) continue;
+    const nodeId = typeof raw.nodeId === "string" ? raw.nodeId.trim() : "";
+    const beatKey = typeof raw.beatKey === "string" ? raw.beatKey.trim() : "";
+    if (!nodeId || !beatKey) continue;
+    const entry: BeatAssignmentEntry = { nodeId, beatKey };
+    if (typeof raw.actNumber === "number" && Number.isFinite(raw.actNumber)) {
+      entry.actNumber = Math.max(1, Math.min(5, Math.round(raw.actNumber)));
+    }
+    if (typeof raw.rationale === "string" && raw.rationale.trim()) {
+      entry.rationale = raw.rationale.trim().slice(0, 400);
+    }
+    assignments.push(entry);
+  }
+  return {
+    storyboardId,
+    branchId,
+    structure,
+    assignments,
+    assignmentCount: assignments.length,
+    overrideExisting,
+    rationale,
+  };
+};
+
+// M9 Phase 3 — plan-op parser shared by hook + remix variants. Mirrors
+// the Python `_sanitize_plan_ops` rules: drop non-dicts, unknown op
+// types, and entries with empty titles. The Convex `commitPlanOps`
+// mutation runs its own shape checks at apply time; this parser is the
+// client-side UX guard so the approval card only shows variants that
+// can actually commit.
+const VALID_PLAN_OPS = new Set([
+  "create_node",
+  "update_node",
+  "delete_node",
+  "create_edge",
+  "update_edge",
+  "delete_edge",
+]);
+
+const VALID_NODE_TYPES = new Set([
+  "scene",
+  "shot",
+  "branch",
+  "merge",
+  "character_ref",
+  "background_ref",
+]);
+
+const VALID_EDGE_TYPES = new Set(["serial", "parallel", "branch", "merge"]);
+
+const parsePlanOpList = (value: unknown): HookVariantPlanOp[] => {
+  if (!Array.isArray(value)) return [];
+  const ops: HookVariantPlanOp[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) continue;
+    const op = typeof raw.op === "string" ? raw.op : "";
+    if (!VALID_PLAN_OPS.has(op)) continue;
+    const title = typeof raw.title === "string" ? raw.title.trim() : "";
+    if (!title) continue;
+    const planOp: HookVariantPlanOp = {
+      op: op as HookVariantPlanOp["op"],
+      title: title.slice(0, 200),
+    };
+    if (typeof raw.opId === "string" && raw.opId.trim()) {
+      planOp.opId = raw.opId.trim().slice(0, 80);
+    }
+    if (typeof raw.rationale === "string" && raw.rationale.trim()) {
+      planOp.rationale = raw.rationale.trim().slice(0, 400);
+    }
+    if (typeof raw.nodeId === "string" && raw.nodeId.trim()) {
+      planOp.nodeId = raw.nodeId.trim();
+    }
+    if (typeof raw.edgeId === "string" && raw.edgeId.trim()) {
+      planOp.edgeId = raw.edgeId.trim();
+    }
+    if (typeof raw.nodeType === "string" && VALID_NODE_TYPES.has(raw.nodeType)) {
+      planOp.nodeType = raw.nodeType as HookVariantPlanOp["nodeType"];
+    }
+    if (typeof raw.label === "string" && raw.label.trim()) {
+      planOp.label = raw.label.trim().slice(0, 400);
+    }
+    if (typeof raw.segment === "string" && raw.segment.trim()) {
+      planOp.segment = raw.segment.trim();
+    }
+    if (
+      isRecord(raw.position)
+      && typeof raw.position.x === "number"
+      && typeof raw.position.y === "number"
+    ) {
+      planOp.position = { x: raw.position.x, y: raw.position.y };
+    }
+    if (typeof raw.sourceNodeId === "string" && raw.sourceNodeId.trim()) {
+      planOp.sourceNodeId = raw.sourceNodeId.trim();
+    }
+    if (typeof raw.targetNodeId === "string" && raw.targetNodeId.trim()) {
+      planOp.targetNodeId = raw.targetNodeId.trim();
+    }
+    if (typeof raw.edgeType === "string" && VALID_EDGE_TYPES.has(raw.edgeType)) {
+      planOp.edgeType = raw.edgeType as HookVariantPlanOp["edgeType"];
+    }
+    if (typeof raw.branchId === "string" && raw.branchId.trim()) {
+      planOp.branchId = raw.branchId.trim();
+    }
+    if (typeof raw.order === "number" && Number.isFinite(raw.order)) {
+      planOp.order = raw.order;
+    }
+    if (typeof raw.isPrimary === "boolean") {
+      planOp.isPrimary = raw.isPrimary;
+    }
+    ops.push(planOp);
+  }
+  return ops;
+};
+
+// Variant-id sanitizer — matches the Python tool so branch names stay
+// URL-safe + consistent across agent + bridge.
+const sanitizeVariantId = (raw: unknown): string => {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!s) return "";
+  const cleaned = Array.from(s)
+    .map((c) => (/[a-z0-9_-]/.test(c) ? c : "-"))
+    .join("")
+    .slice(0, 40);
+  return cleaned || "unnamed";
+};
+
+const parseHookVariantInput = (
+  value: unknown,
+): HookVariantInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const parentBranchId =
+    typeof value.parentBranchId === "string" && value.parentBranchId.length > 0
+      ? value.parentBranchId
+      : "main";
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  const rawVariants = Array.isArray(value.variants) ? value.variants : [];
+  const variants: HookVariantEntry[] = [];
+  for (const raw of rawVariants) {
+    if (!isRecord(raw)) continue;
+    const variantId = sanitizeVariantId(raw.variantId);
+    if (!variantId) continue;
+    const planOps = parsePlanOpList(raw.planOps);
+    if (planOps.length === 0) continue;
+    const branchName =
+      (typeof raw.branchName === "string" && raw.branchName.trim()
+        ? raw.branchName.trim()
+        : `Hook variant ${variantId}`).slice(0, 100);
+    variants.push({
+      variantId,
+      rationale:
+        typeof raw.rationale === "string" ? raw.rationale.slice(0, 800) : "",
+      expectedRetention:
+        typeof raw.expectedRetention === "string"
+          ? raw.expectedRetention.slice(0, 300)
+          : "",
+      branchName,
+      planOps,
+    });
+  }
+  return {
+    storyboardId,
+    parentBranchId,
+    variants,
+    variantCount: variants.length,
+    rationale,
+  };
+};
+
+const VALID_STRUCTURES = new Set([
+  "save_the_cat",
+  "harmon_circle",
+  "three_act",
+  "kishotenketsu",
+  "hook_first",
+]);
+
+const parseStructuralRemixInput = (
+  value: unknown,
+): StructuralRemixInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const parentBranchId =
+    typeof value.parentBranchId === "string" && value.parentBranchId.length > 0
+      ? value.parentBranchId
+      : "main";
+  const rawStructure =
+    typeof value.targetStructure === "string" ? value.targetStructure : "";
+  const targetStructure = VALID_STRUCTURES.has(rawStructure)
+    ? rawStructure
+    : "save_the_cat";
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  const rawVariants = Array.isArray(value.variants) ? value.variants : [];
+  const variants: StructuralRemixEntry[] = [];
+  for (const raw of rawVariants) {
+    if (!isRecord(raw)) continue;
+    const variantId = sanitizeVariantId(raw.variantId);
+    if (!variantId) continue;
+    const planOps = parsePlanOpList(raw.planOps);
+    if (planOps.length === 0) continue;
+    const branchName =
+      (typeof raw.branchName === "string" && raw.branchName.trim()
+        ? raw.branchName.trim()
+        : `Remix ${targetStructure.replace(/_/g, " ")} ${variantId}`).slice(0, 100);
+    variants.push({
+      variantId,
+      rationale:
+        typeof raw.rationale === "string" ? raw.rationale.slice(0, 800) : "",
+      strategy:
+        typeof raw.strategy === "string" ? raw.strategy.slice(0, 60) : "",
+      branchName,
+      planOps,
+    });
+  }
+  return {
+    storyboardId,
+    parentBranchId,
+    targetStructure,
+    variants,
+    variantCount: variants.length,
+    rationale,
+  };
+};
+
+// M9 Phase 4 — transition vocabulary mirrors _KNOWN_TRANSITION_INTENTS
+// in the Python tool. Kept as a module-scoped Set so the approval card
+// can highlight "normalized" intents + the VariantComparePanel can
+// render intent badges with consistent icons across both sides.
+export const KNOWN_TRANSITION_INTENTS = new Set([
+  "match_cut",
+  "j_cut",
+  "l_cut",
+  "cross_cut_accelerate",
+  "hard_cut",
+  "time_jump",
+  "smash_cut",
+  "iris",
+  "whip_pan",
+  "dissolve",
+]);
+
+const parseTransitionProposalInput = (
+  value: unknown,
+): TransitionProposalInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const branchId =
+    typeof value.branchId === "string" && value.branchId.length > 0
+      ? value.branchId
+      : "main";
+  const sourceNodeId =
+    typeof value.sourceNodeId === "string" ? value.sourceNodeId.trim() : "";
+  const targetNodeId =
+    typeof value.targetNodeId === "string" ? value.targetNodeId.trim() : "";
+  if (!sourceNodeId || !targetNodeId) return null;
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  const rawProposals = Array.isArray(value.proposals) ? value.proposals : [];
+  const proposals: TransitionProposalEntry[] = [];
+  for (const raw of rawProposals) {
+    if (!isRecord(raw)) continue;
+    const intent =
+      typeof raw.intent === "string" ? raw.intent.trim().toLowerCase() : "";
+    if (!intent) continue;
+    const entry: TransitionProposalEntry = {
+      intent: KNOWN_TRANSITION_INTENTS.has(intent) ? intent : "hard_cut",
+    };
+    if (typeof raw.rawIntent === "string" && raw.rawIntent.trim()) {
+      entry.rawIntent = raw.rawIntent.trim().slice(0, 60);
+    }
+    if (typeof raw.rationale === "string" && raw.rationale.trim()) {
+      entry.rationale = raw.rationale.trim().slice(0, 400);
+    }
+    if (typeof raw.sharedElement === "string" && raw.sharedElement.trim()) {
+      entry.sharedElement = raw.sharedElement.trim().slice(0, 200);
+    }
+    const planOps = parsePlanOpList(raw.planOps);
+    if (planOps.length > 0) {
+      entry.planOps = planOps;
+    }
+    if (typeof raw.rank === "number" && Number.isFinite(raw.rank)) {
+      entry.rank = Math.max(1, Math.min(10, Math.round(raw.rank)));
+    }
+    proposals.push(entry);
+  }
+  return {
+    storyboardId,
+    branchId,
+    sourceNodeId,
+    targetNodeId,
+    proposals,
+    proposalCount: proposals.length,
+    rationale,
+  };
+};
+
+const parseMotifPlantInput = (value: unknown): MotifPlantInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const branchId =
+    typeof value.branchId === "string" && value.branchId.length > 0
+      ? value.branchId
+      : "main";
+  const motifKey =
+    typeof value.motifKey === "string" ? value.motifKey.trim() : "";
+  const targetNodeId =
+    typeof value.targetNodeId === "string" ? value.targetNodeId.trim() : "";
+  if (!motifKey || !targetNodeId) return null;
+  const description =
+    typeof value.description === "string" ? value.description : "";
+  const visualVocabulary =
+    typeof value.visualVocabulary === "string"
+      ? value.visualVocabulary
+      : "";
+  const sourceNodeIds = Array.isArray(value.sourceNodeIds)
+    ? (value.sourceNodeIds as unknown[])
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .map((s) => s.trim())
+    : [];
+  const payoffNodeIds = Array.isArray(value.payoffNodeIds)
+    ? (value.payoffNodeIds as unknown[])
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .map((s) => s.trim())
+    : [];
+  const planOps = parsePlanOpList(value.planOps);
+  const rationale =
+    typeof value.rationale === "string" ? value.rationale : "";
+  return {
+    storyboardId,
+    branchId,
+    motifKey,
+    targetNodeId,
+    description,
+    visualVocabulary,
+    sourceNodeIds,
+    payoffNodeIds,
+    planOps,
+    rationale,
+  };
+};
+
+const parseShotSfxBatchInput = (
+  value: unknown,
+): ShotSfxBatchInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  if (!storyboardId) return null;
+  const branchId =
+    typeof value.branchId === "string" && value.branchId.length > 0
+      ? value.branchId
+      : "main";
+  const rationale = typeof value.rationale === "string" ? value.rationale : "";
+  const nodeCount =
+    typeof value.nodeCount === "number" && Number.isFinite(value.nodeCount)
+      ? Math.max(0, Math.floor(value.nodeCount))
+      : 0;
+  const skipExisting =
+    typeof value.skipExisting === "boolean" ? value.skipExisting : true;
+  const concurrencyRaw =
+    typeof value.concurrency === "number" && Number.isFinite(value.concurrency)
+      ? Math.floor(value.concurrency)
+      : 3;
+  // SFX batch caps at 5 — ElevenLabs Sound Effects tolerates burst
+  // parallelism but we stay below the audio batch cap to avoid
+  // starving the OpenAI narration batch when both run together.
+  const concurrency = Math.max(1, Math.min(5, concurrencyRaw));
+  return {
+    storyboardId,
+    branchId,
+    nodeCount,
+    rationale,
+    skipExisting,
+    concurrency,
+  };
+};
+
 const parseGenerateShotAudioBatchInput = (
   value: unknown,
 ): GenerateShotAudioBatchInput | null => {
@@ -431,6 +1076,41 @@ const parseGenerateShotAudioBatchInput = (
     model,
     speed,
   };
+};
+
+const ALLOWED_TTS_VOICES = new Set([
+  "alloy",
+  "echo",
+  "fable",
+  "onyx",
+  "nova",
+  "shimmer",
+]);
+
+const parseAssignVoiceCastInput = (
+  value: unknown,
+): AssignVoiceCastInput | null => {
+  if (!isRecord(value)) return null;
+  const storyboardId =
+    typeof value.storyboardId === "string" ? value.storyboardId : "";
+  const rationale = typeof value.rationale === "string" ? value.rationale : "";
+  if (!storyboardId) return null;
+  if (!Array.isArray(value.assignments)) return null;
+  const assignments: VoiceCastAssignment[] = [];
+  for (const raw of value.assignments) {
+    if (!isRecord(raw)) continue;
+    const packId = typeof raw.packId === "string" ? raw.packId.trim() : "";
+    const voiceRaw =
+      typeof raw.voice === "string" ? raw.voice.trim().toLowerCase() : "";
+    if (!packId) continue;
+    // Empty string is preserved — it's the "clear mapping" signal.
+    // Non-empty strings must match the OpenAI TTS vocabulary to be
+    // honored; anything else is dropped silently so a misbehaving
+    // agent can't crash the handler.
+    if (voiceRaw.length > 0 && !ALLOWED_TTS_VOICES.has(voiceRaw)) continue;
+    assignments.push({ packId, voice: voiceRaw });
+  }
+  return { storyboardId, assignments, rationale };
 };
 
 const parseExportReelInput = (value: unknown): ExportReelInput | null => {
@@ -1075,6 +1755,39 @@ export function StoryboardCopilotBridge({
     mutationRef("agentTeams:generateTeamFromPrompt"),
   );
   const applyPromptDraftMutation = useMutation(mutationRef("agentTeams:applyPromptDraftToRevision"));
+  // M8 follow-up — score attach flow. `request_generate_score` on
+  // approve posts to /api/media/generate-score, then uses these
+  // mutations to create the asset row + attach it to the storyboard.
+  const setStoryboardScoreMutation = useMutation(
+    mutationRef("storyboards:setStoryboardScore"),
+  );
+  // M9 Phase 2 — beat assignment approval handler. Patches each shot
+  // node's narrative fields + replaces the beat plan row in one pass.
+  const setNodeNarrativeFieldsMutation = useMutation(
+    mutationRef("narrativeState:setNodeNarrativeFields"),
+  );
+  const upsertBeatPlanMutation = useMutation(
+    mutationRef("narrativeState:upsertBeatPlan"),
+  );
+  // M9 Phase 3 — variant generation approval handlers. Each approved
+  // variant becomes a narrative-git branch + commit; siblings stay
+  // around until the producer picks one via the Variant Compare tab.
+  const createNarrativeBranchMutation = useMutation(
+    mutationRef("narrativeGit:createBranch"),
+  );
+  const upsertVariantMutation = useMutation(
+    mutationRef("narrativeState:upsertVariant"),
+  );
+  // M9 Phase 4 — transition + motif mutations.
+  const setEdgeTransitionIntentMutation = useMutation(
+    mutationRef("narrativeState:setEdgeTransitionIntent"),
+  );
+  const upsertMotifMutation = useMutation(
+    mutationRef("narrativeState:upsertMotif"),
+  );
+  const setIdentityPackVoiceMutation = useMutation(
+    mutationRef("continuityOS:setIdentityPackVoice"),
+  );
   const recordToolCallAudit = useMutation(mutationRef("toolAudits:recordToolCallAudit"));
 
   const adapterDependencies = useMemo<AdapterDependencies>(
@@ -2515,6 +3228,829 @@ export function StoryboardCopilotBridge({
   });
 
   useHumanInTheLoop({
+    name: "request_generate_shot_sfx_batch",
+    description:
+      "Approve/reject generating per-shot ambient/foley SFX for this storyboard. Uses ElevenLabs Sound Effects; returns 501 if the provider isn't configured.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "branchId", type: "string", description: "Narrative branch id", required: true },
+      { name: "nodeCount", type: "number", description: "Shots in batch (diagnostic)", required: true },
+      { name: "rationale", type: "string", description: "Why run SFX now", required: true },
+      { name: "skipExisting", type: "boolean", description: "Skip shots that already have SFX", required: false },
+      { name: "concurrency", type: "number", description: "Parallel workers (1-5)", required: false },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      const input = parseShotSfxBatchInput(args);
+      if (!input) {
+        return (
+          <ToolStatusCard
+            name="request_generate_shot_sfx_batch"
+            status="failed"
+            args={JSON.stringify(args ?? {}, null, 2)}
+            result={JSON.stringify({ error: "Invalid SFX batch payload" })}
+          />
+        );
+      }
+      const isOnTargetStoryboard =
+        Boolean(storyboardId) && storyboardId === input.storyboardId;
+      const subtitle = `${input.nodeCount} shot${input.nodeCount === 1 ? "" : "s"} · concurrency ${input.concurrency}${input.skipExisting ? " · skip existing" : " · regenerate all"}${isOnTargetStoryboard ? "" : " · will navigate"}`;
+
+      // Dispatch a CustomEvent that `GenerateAllSfxsButton` listens
+      // for — mirrors the narration batch pattern so producers see a
+      // live progress grid in the storyboard header regardless of
+      // whether the batch was agent-initiated or producer-initiated.
+      // Agent HITL path: approve → event → button drives the SSE
+      // stream → producer watches per-shot progress.
+      const startBatch = () => {
+        const detail: ShotSfxBatchTriggerDetail = {
+          storyboardId: input.storyboardId,
+          skipExisting: input.skipExisting,
+          concurrency: input.concurrency,
+        };
+        if (isOnTargetStoryboard) {
+          dispatchShotSfxBatchTrigger(detail);
+          return { navigated: false, dispatched: true };
+        }
+        router.push(`/storyboard/${encodeURIComponent(input.storyboardId)}`);
+        // The target page mounts asynchronously; defer the dispatch so
+        // the button's listener is attached before the event fires.
+        window.setTimeout(() => dispatchShotSfxBatchTrigger(detail), 600);
+        return { navigated: true, dispatched: true };
+      };
+
+      return (
+        <ApprovalCard
+          title="Generate all shot SFX"
+          subtitle={subtitle}
+          body={
+            input.rationale
+            || "Generate an ambient / foley track for every shot. Mixed UNDER the narration in the final reel."
+          }
+          onApprove={async () => {
+            const outcome = startBatch();
+            await auditToolCall({
+              tool: "request_generate_shot_sfx_batch",
+              result: "success",
+              details: {
+                storyboardId: input.storyboardId,
+                nodeCount: input.nodeCount,
+                concurrency: input.concurrency,
+                skipExisting: input.skipExisting,
+                navigated: outcome.navigated,
+              },
+            });
+            respond({ approved: true, ...outcome });
+          }}
+          onEdit={async () => {
+            const outcome = startBatch();
+            await auditToolCall({
+              tool: "request_generate_shot_sfx_batch",
+              result: "success",
+              details: {
+                storyboardId: input.storyboardId,
+                nodeCount: input.nodeCount,
+                concurrency: input.concurrency,
+                skipExisting: input.skipExisting,
+                navigated: outcome.navigated,
+                edited: true,
+              },
+            });
+            respond({ approved: true, edited: true, ...outcome });
+          }}
+          onReject={async () => {
+            await auditToolCall({
+              tool: "request_generate_shot_sfx_batch",
+              result: "blocked",
+              details: { storyboardId: input.storyboardId },
+            });
+            respond({
+              approved: false,
+              blockedReason: "Producer rejected shot SFX batch.",
+            });
+          }}
+        />
+      );
+    },
+  });
+
+  useHumanInTheLoop({
+    name: "request_generate_score",
+    description:
+      "Approve/reject generating a reel-level background score (music bed) via ElevenLabs Music. Replaces any existing active score on the storyboard.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "prompt", type: "string", description: "Music prompt (capped at 600 chars)", required: true },
+      { name: "durationS", type: "number", description: "Duration in seconds (10-300)", required: false },
+      { name: "volumeDb", type: "number", description: "Mix level in dB (-40..0); default -18", required: false },
+      { name: "rationale", type: "string", description: "Why this score, why now", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      const input = parseGenerateScoreInput(args);
+      if (!input) {
+        return (
+          <ToolStatusCard
+            name="request_generate_score"
+            status="failed"
+            args={JSON.stringify(args ?? {}, null, 2)}
+            result={JSON.stringify({
+              error:
+                "Invalid score payload: need storyboardId + non-empty prompt.",
+            })}
+          />
+        );
+      }
+      const isOnTargetStoryboard =
+        Boolean(storyboardId) && storyboardId === input.storyboardId;
+      const subtitle = `${input.durationS}s · ${input.volumeDb} dB${isOnTargetStoryboard ? "" : " · will navigate"}`;
+
+      // Attach flow: POST to generate-score → createMediaAsset
+      // (kind=score, sentinel nodeId) → setStoryboardScore. Matches
+      // the ReelScorePanel's producer-initiated flow exactly so the
+      // agent path and the button path produce identical Convex state.
+      const runAttach = async (): Promise<{
+        mediaAssetId?: string;
+        error?: string;
+      }> => {
+        try {
+          const res = await fetch("/api/media/generate-score", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: input.prompt,
+              durationS: input.durationS,
+              volumeDb: input.volumeDb,
+              storyboardId: input.storyboardId,
+            }),
+          });
+          if (!res.ok) {
+            const payload = (await res.json().catch(() => ({}))) as {
+              error?: string;
+            };
+            return {
+              error:
+                payload.error ?? `Score generation failed (${res.status})`,
+            };
+          }
+          const data = (await res.json()) as {
+            url: string;
+            provider: string;
+          };
+          const mediaAssetId = (await createMediaAsset({
+            storyboardId: input.storyboardId as never,
+            nodeId: "__score__",
+            kind: "score",
+            sourceUrl: data.url,
+            modelId: data.provider,
+            prompt: input.prompt,
+            status: "completed",
+            metadata: {
+              durationS: String(input.durationS),
+              volumeDb: String(input.volumeDb),
+            },
+          })) as string;
+          await setStoryboardScoreMutation({
+            storyboardId: input.storyboardId as never,
+            mediaAssetId: mediaAssetId as never,
+            volumeDb: input.volumeDb,
+          });
+          return { mediaAssetId };
+        } catch (err) {
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      };
+
+      return (
+        <ApprovalCard
+          title="Attach reel score"
+          subtitle={subtitle}
+          body={
+            (input.rationale ? `${input.rationale}\n\n` : "")
+            + `Prompt: "${input.prompt}"`
+          }
+          onApprove={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await runAttach();
+            await auditToolCall({
+              tool: "request_generate_score",
+              result: outcome.error ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                durationS: input.durationS,
+                volumeDb: input.volumeDb,
+                mediaAssetId: outcome.mediaAssetId,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+              },
+            });
+            if (outcome.error) {
+              respond({ approved: false, blockedReason: outcome.error });
+            } else {
+              respond({
+                approved: true,
+                mediaAssetId: outcome.mediaAssetId,
+              });
+            }
+          }}
+          onEdit={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await runAttach();
+            await auditToolCall({
+              tool: "request_generate_score",
+              result: outcome.error ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                durationS: input.durationS,
+                volumeDb: input.volumeDb,
+                mediaAssetId: outcome.mediaAssetId,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+                edited: true,
+              },
+            });
+            if (outcome.error) {
+              respond({ approved: false, blockedReason: outcome.error });
+            } else {
+              respond({
+                approved: true,
+                edited: true,
+                mediaAssetId: outcome.mediaAssetId,
+              });
+            }
+          }}
+          onReject={async () => {
+            await auditToolCall({
+              tool: "request_generate_score",
+              result: "blocked",
+              details: { storyboardId: input.storyboardId },
+            });
+            respond({
+              approved: false,
+              blockedReason: "Producer rejected score generation.",
+            });
+          }}
+        />
+      );
+    },
+  });
+
+  useHumanInTheLoop({
+    name: "request_beat_assignment",
+    description:
+      "Approve/reject a beat plan mapping storyboard nodes to canonical beats (Save-the-Cat / Harmon Circle / Three-Act / Kishōtenketsu / Hook-First). Applies node narrative fields + replaces the beat plan row on approve.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "branchId", type: "string", description: "Narrative branch id", required: true },
+      { name: "structure", type: "string", description: "Beat structure", required: true },
+      {
+        name: "assignments",
+        type: "object[]",
+        description: "Array of { nodeId, beatKey, actNumber?, rationale? } entries",
+        required: true,
+        attributes: [
+          { name: "nodeId", type: "string", description: "Shot node id", required: true },
+          { name: "beatKey", type: "string", description: "Canonical beat key for the structure", required: true },
+          { name: "actNumber", type: "number", description: "Act 1-5", required: false },
+          { name: "rationale", type: "string", description: "Why this node for this beat", required: false },
+        ],
+      },
+      { name: "rationale", type: "string", description: "Overall rationale", required: true },
+      { name: "overrideExisting", type: "boolean", description: "Override already-assigned slots (producer opt-in)", required: false },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      const input = parseBeatAssignmentInput(args);
+      if (!input || input.assignments.length === 0) {
+        return (
+          <ToolStatusCard
+            name="request_beat_assignment"
+            status="failed"
+            args={JSON.stringify(args ?? {}, null, 2)}
+            result={JSON.stringify({
+              error:
+                "Invalid beat-assignment payload: need storyboardId + structure + at least one valid { nodeId, beatKey } assignment.",
+            })}
+          />
+        );
+      }
+      const isOnTargetStoryboard =
+        Boolean(storyboardId) && storyboardId === input.storyboardId;
+      const subtitle = `${input.assignmentCount} beat${input.assignmentCount === 1 ? "" : "s"} · ${input.structure}${input.overrideExisting ? " · override on" : ""}${isOnTargetStoryboard ? "" : " · will navigate"}`;
+      const body =
+        (input.rationale ? `${input.rationale}\n\n` : "")
+        + input.assignments
+          .map((a) => {
+            const actSuffix =
+              typeof a.actNumber === "number" ? ` [act ${a.actNumber}]` : "";
+            const rSuffix = a.rationale ? ` — ${a.rationale}` : "";
+            return `${a.beatKey} ← ${a.nodeId}${actSuffix}${rSuffix}`;
+          })
+          .join("\n");
+
+      // Commit flow: for each entry, patch node narrative fields
+      // (beatType + actNumber) via setNodeNarrativeFields; then
+      // replace the narrativeBeats row with the merged plan via
+      // upsertBeatPlan. We DON'T snapshot-then-rebuild: the upsert
+      // receives the assigned-only set; slots the agent didn't touch
+      // keep their prior state once the phase-2 hydration logic in
+      // narrativeState:getBeatPlan (producer-facing) runs.
+      const applyBeats = async (): Promise<{
+        applied: number;
+        failed: number;
+        error?: string;
+      }> => {
+        let applied = 0;
+        let failed = 0;
+        let firstError: string | undefined;
+        // Patch node fields sequentially — Convex mutations already
+        // serialize per-document, so parallelizing wouldn't help and
+        // would noisy-fail the audit trail. For a 15-beat plan this
+        // is 15 round-trips; acceptable for a HITL-gated pass.
+        for (const entry of input.assignments) {
+          try {
+            await setNodeNarrativeFieldsMutation({
+              storyboardId: input.storyboardId as never,
+              nodeId: entry.nodeId,
+              beatType: entry.beatKey,
+              actNumber:
+                typeof entry.actNumber === "number"
+                  ? entry.actNumber
+                  : undefined,
+            });
+            applied += 1;
+          } catch (err) {
+            failed += 1;
+            if (firstError === undefined) {
+              firstError =
+                err instanceof Error
+                  ? err.message
+                  : "setNodeNarrativeFields failed";
+            }
+          }
+        }
+        // Replace the beat plan row with a freshly-seeded-plus-merged
+        // list. Each assignment becomes an `assigned` slot; slots the
+        // agent didn't touch revert to `planned` since we don't have
+        // prior state visible on the bridge side. For phase 2 this is
+        // fine — future phases can wire a diff-based upsert when the
+        // producer starts editing individual slots in the ribbon.
+        try {
+          const beats = input.assignments.map((a) => ({
+            beatKey: a.beatKey,
+            expectedActNumber: a.actNumber,
+            nodeId: a.nodeId,
+            status: "assigned" as const,
+            rationale: a.rationale,
+          }));
+          await upsertBeatPlanMutation({
+            storyboardId: input.storyboardId as never,
+            branchId: input.branchId,
+            structure: input.structure as never,
+            beats,
+          });
+        } catch (err) {
+          if (firstError === undefined) {
+            firstError =
+              err instanceof Error
+                ? err.message
+                : "upsertBeatPlan failed";
+          }
+          failed += 1;
+        }
+        return { applied, failed, error: firstError };
+      };
+
+      return (
+        <ApprovalCard
+          title={`Apply beat plan (${input.structure.replace(/_/g, " ")})`}
+          subtitle={subtitle}
+          body={body}
+          onApprove={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await applyBeats();
+            await auditToolCall({
+              tool: "request_beat_assignment",
+              result: outcome.failed > 0 ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                structure: input.structure,
+                assignmentCount: input.assignmentCount,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                overrideExisting: input.overrideExisting,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+              },
+            });
+            if (outcome.failed > 0 && outcome.applied === 0) {
+              respond({
+                approved: false,
+                blockedReason:
+                  outcome.error ?? "All beat assignments failed.",
+              });
+            } else {
+              respond({
+                approved: true,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                structure: input.structure,
+              });
+            }
+          }}
+          onEdit={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await applyBeats();
+            await auditToolCall({
+              tool: "request_beat_assignment",
+              result: outcome.failed > 0 ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                structure: input.structure,
+                assignmentCount: input.assignmentCount,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+                edited: true,
+              },
+            });
+            if (outcome.failed > 0 && outcome.applied === 0) {
+              respond({
+                approved: false,
+                blockedReason:
+                  outcome.error ?? "All beat assignments failed.",
+              });
+            } else {
+              respond({
+                approved: true,
+                edited: true,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                structure: input.structure,
+              });
+            }
+          }}
+          onReject={async () => {
+            await auditToolCall({
+              tool: "request_beat_assignment",
+              result: "blocked",
+              details: {
+                storyboardId: input.storyboardId,
+                structure: input.structure,
+                assignmentCount: input.assignmentCount,
+              },
+            });
+            respond({
+              approved: false,
+              blockedReason: "Producer rejected beat assignment.",
+            });
+          }}
+        />
+      );
+    },
+  });
+
+  // M9 Phase 3 — request_hook_variants approval handler.
+  //
+  // On approve: each variant becomes its own narrative-git branch
+  // `variant/hook-<id>` off the parent HEAD; planOps commit to that
+  // branch; a narrativeVariants row links branch → variant metadata.
+  // On edit: producer can prune the variant set to a subset via
+  // checkboxes in the extra slot (variantToKeep Set state).
+  // On reject: no mutations, just audit.
+  //
+  // Each branch's commit uses a synthetic approvalToken built from the
+  // approval task id so commitPlanOps' "approved:" prefix check passes.
+  // We never touch applyMergePolicy here — that's a follow-up after
+  // the producer picks a winner in Variant Compare.
+  useHumanInTheLoop({
+    name: "request_hook_variants",
+    description:
+      "Approve/reject N cold-open variants (each becomes a narrative-git branch). Short-form (<90s) reels live or die on the first 3 seconds; this card lets the producer commit 1-3 alternate openings for side-by-side comparison in the Variant Compare tab.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "parentBranchId", type: "string", description: "Branch to fork variants from", required: true },
+      {
+        name: "variants",
+        type: "object[]",
+        description: "Each: { variantId, rationale, expectedRetention, branchName, planOps[] }",
+        required: true,
+      },
+      { name: "rationale", type: "string", description: "Why three variants now", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      return (
+        <VariantProposalRenderer
+          variantType="hook"
+          input={parseHookVariantInput(args)}
+          args={args}
+          storyboardId={storyboardId}
+          safeStoryboardId={safeStoryboardId}
+          respond={respond}
+          router={router}
+          createApprovalTask={createApprovalTask}
+          resolveApprovalTask={resolveApprovalTask}
+          createBranch={createNarrativeBranchMutation}
+          commitPlanOps={commitPlanOps}
+          upsertVariant={upsertVariantMutation}
+          auditToolCall={auditToolCall}
+        />
+      );
+    },
+  });
+
+  // M9 Phase 3 — request_structural_remix approval handler.
+  //
+  // Same commit shape as the hook card: each variant → branch
+  // `variant/remix-<structure>-<id>` → commit → narrativeVariants row.
+  // Differences: variantType="remix", the card header calls out the
+  // target structure, and each variant shows its strategy tag so the
+  // producer can compare across approaches at a glance.
+  useHumanInTheLoop({
+    name: "request_structural_remix",
+    description:
+      "Approve/reject N structural-remix variants. Each variant is a complete alternate beat ordering (in-medias-res, chrono-reorder, parallel-intercut, harmon-reframe) committed to its own branch.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "parentBranchId", type: "string", description: "Branch to fork variants from", required: true },
+      { name: "targetStructure", type: "string", description: "Beat structure the remix targets", required: true },
+      {
+        name: "variants",
+        type: "object[]",
+        description: "Each: { variantId, rationale, strategy, branchName, planOps[] }",
+        required: true,
+      },
+      { name: "rationale", type: "string", description: "Why a structural remix now", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      return (
+        <VariantProposalRenderer
+          variantType="remix"
+          input={parseStructuralRemixInput(args)}
+          args={args}
+          storyboardId={storyboardId}
+          safeStoryboardId={safeStoryboardId}
+          respond={respond}
+          router={router}
+          createApprovalTask={createApprovalTask}
+          resolveApprovalTask={resolveApprovalTask}
+          createBranch={createNarrativeBranchMutation}
+          commitPlanOps={commitPlanOps}
+          upsertVariant={upsertVariantMutation}
+          auditToolCall={auditToolCall}
+        />
+      );
+    },
+  });
+
+  // M9 Phase 4 — request_transition_proposal approval handler.
+  //
+  // Producer picks ONE of the ranked transition proposals via radio
+  // buttons. On approve:
+  //   1. Look up the edge between sourceNodeId + targetNodeId in the
+  //      bridge's current `edges` list (fed from the storyboard page).
+  //      If the edge doesn't exist yet, fail cleanly — the producer
+  //      needs to author the connection first. Transitions layer on
+  //      top of graph topology; we don't auto-create edges here.
+  //   2. Optionally commit the proposal's planOps (motif plant,
+  //      shot addition, etc.) via commitPlanOps.
+  //   3. Patch transitionIntent on the edge via
+  //      setEdgeTransitionIntent.
+  useHumanInTheLoop({
+    name: "request_transition_proposal",
+    description:
+      "Approve/reject a ranked set of transition proposals between two adjacent nodes. Producer picks one; the chosen intent lands on the connecting edge's transitionIntent field.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "branchId", type: "string", description: "Branch id", required: true },
+      { name: "sourceNodeId", type: "string", description: "Source node id", required: true },
+      { name: "targetNodeId", type: "string", description: "Target node id", required: true },
+      {
+        name: "proposals",
+        type: "object[]",
+        description: "Ranked transition proposals",
+        required: true,
+      },
+      { name: "rationale", type: "string", description: "Overall rationale", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) return <></>;
+      return (
+        <TransitionProposalRenderer
+          input={parseTransitionProposalInput(args)}
+          args={args}
+          storyboardId={storyboardId}
+          safeStoryboardId={safeStoryboardId}
+          edges={edges}
+          respond={respond}
+          router={router}
+          createApprovalTask={createApprovalTask}
+          resolveApprovalTask={resolveApprovalTask}
+          commitPlanOps={commitPlanOps}
+          setEdgeTransitionIntent={setEdgeTransitionIntentMutation}
+          auditToolCall={auditToolCall}
+        />
+      );
+    },
+  });
+
+  // M9 Phase 4 — request_motif_plant approval handler.
+  //
+  // Single-target commit. On approve:
+  //   1. Commit the planOps (typically patches the target shot's
+  //      motifIds array + may add a new scene/shot).
+  //   2. Upsert the motif registry row: Convex re-derives
+  //      landedStatus from sources/payoffs presence so the
+  //      MotifMapPanel reflects the new state without the bridge
+  //      needing to guess.
+  useHumanInTheLoop({
+    name: "request_motif_plant",
+    description:
+      "Approve/reject planting or landing a motif at a specific node. Commits planOps + upserts the motif registry row; landedStatus is auto-derived.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "branchId", type: "string", description: "Branch id", required: true },
+      { name: "motifKey", type: "string", description: "Slug-cased motif id", required: true },
+      { name: "targetNodeId", type: "string", description: "Node to plant/land the motif at", required: true },
+      { name: "visualVocabulary", type: "string", description: "Concrete visual language for payoff shots", required: false },
+      { name: "description", type: "string", description: "Motif description", required: false },
+      {
+        name: "sourceNodeIds",
+        type: "string[]",
+        description: "Nodes where the motif is planted",
+        required: false,
+      },
+      {
+        name: "payoffNodeIds",
+        type: "string[]",
+        description: "Nodes where the motif pays off",
+        required: false,
+      },
+      {
+        name: "planOps",
+        type: "object[]",
+        description: "Graph patch ops to apply",
+        required: false,
+      },
+      { name: "rationale", type: "string", description: "Why this plant now", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) return <></>;
+      return (
+        <MotifPlantRenderer
+          input={parseMotifPlantInput(args)}
+          args={args}
+          storyboardId={storyboardId}
+          safeStoryboardId={safeStoryboardId}
+          respond={respond}
+          router={router}
+          createApprovalTask={createApprovalTask}
+          resolveApprovalTask={resolveApprovalTask}
+          commitPlanOps={commitPlanOps}
+          upsertMotif={upsertMotifMutation}
+          auditToolCall={auditToolCall}
+        />
+      );
+    },
+  });
+
+  useHumanInTheLoop({
+    name: "request_dailies_critic_review",
+    description:
+      "Approve/reject dispatching the dailies_critic subagent on a specific dailies reel. The critic produces a structured critique + repair proposal — it does not mutate state itself.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id", required: true },
+      { name: "dailiesReelId", type: "string", description: "dailies.reelId to audit", required: true },
+      { name: "rationale", type: "string", description: "Why audit now", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      const input = parseDailiesCriticReviewInput(args);
+      if (!input) {
+        return (
+          <ToolStatusCard
+            name="request_dailies_critic_review"
+            status="failed"
+            args={JSON.stringify(args ?? {}, null, 2)}
+            result={JSON.stringify({
+              error:
+                "Invalid payload: need storyboardId + dailiesReelId.",
+            })}
+          />
+        );
+      }
+      const isOnTargetStoryboard =
+        Boolean(storyboardId) && storyboardId === input.storyboardId;
+      const subtitle = `reel ${input.dailiesReelId.slice(0, 8)}…${isOnTargetStoryboard ? "" : " · will navigate"}`;
+      return (
+        <ApprovalCard
+          title="Run dailies critic review"
+          subtitle={subtitle}
+          body={
+            input.rationale
+            || "Dispatch the dailies_critic subagent to audit this reel and propose minimal repairs."
+          }
+          onApprove={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            await auditToolCall({
+              tool: "request_dailies_critic_review",
+              result: "success",
+              details: {
+                storyboardId: input.storyboardId,
+                dailiesReelId: input.dailiesReelId,
+                navigated: !isOnTargetStoryboard,
+              },
+            });
+            // Approval is the dispatch signal — the supervisor loops
+            // back with a `task()` delegation to dailies_critic on the
+            // next turn. We don't trigger the critic here because the
+            // critic's output is an agent-side plan, not a mutation.
+            respond({
+              approved: true,
+              dailiesReelId: input.dailiesReelId,
+            });
+          }}
+          onReject={async () => {
+            await auditToolCall({
+              tool: "request_dailies_critic_review",
+              result: "blocked",
+              details: {
+                storyboardId: input.storyboardId,
+                dailiesReelId: input.dailiesReelId,
+              },
+            });
+            respond({
+              approved: false,
+              blockedReason:
+                "Producer rejected dailies critic dispatch.",
+            });
+          }}
+          onEdit={async () => {
+            // No semantic edit on a pure dispatch — treat Edit as
+            // Approve so the button is still useful.
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            await auditToolCall({
+              tool: "request_dailies_critic_review",
+              result: "success",
+              details: {
+                storyboardId: input.storyboardId,
+                dailiesReelId: input.dailiesReelId,
+                edited: true,
+              },
+            });
+            respond({
+              approved: true,
+              edited: true,
+              dailiesReelId: input.dailiesReelId,
+            });
+          }}
+        />
+      );
+    },
+  });
+
+  useHumanInTheLoop({
     name: "request_export_reel",
     description:
       "Approve/reject running the server-side ffmpeg pipeline to export this storyboard's reel as a single mp4 file.",
@@ -2632,6 +4168,180 @@ export function StoryboardCopilotBridge({
     },
   });
 
+  useHumanInTheLoop({
+    name: "request_assign_voice_cast",
+    description:
+      "Approve/reject a batch of per-character TTS voice assignments written to identityPacks.voice. Producers can edit the batch before applying.",
+    parameters: [
+      { name: "storyboardId", type: "string", description: "Storyboard id the identity packs belong to", required: true },
+      {
+        name: "assignments",
+        type: "object[]",
+        description: "Array of { packId, voice } pairs; voice may be empty to clear a mapping",
+        required: true,
+        attributes: [
+          { name: "packId", type: "string", description: "Identity pack id", required: true },
+          { name: "voice", type: "string", description: "OpenAI TTS voice (alloy|echo|fable|onyx|nova|shimmer) or empty to clear", required: true },
+        ],
+      },
+      { name: "rationale", type: "string", description: "Why this cast", required: true },
+    ],
+    render: ({ args, status, respond }) => {
+      if (status !== "executing" || !respond) {
+        return <></>;
+      }
+      const input = parseAssignVoiceCastInput(args);
+      if (!input || input.assignments.length === 0) {
+        return (
+          <ToolStatusCard
+            name="request_assign_voice_cast"
+            status="failed"
+            args={JSON.stringify(args ?? {}, null, 2)}
+            result={JSON.stringify({
+              error:
+                "Invalid voice-cast payload: need storyboardId and at least one { packId, voice } assignment.",
+            })}
+          />
+        );
+      }
+      const isOnTargetStoryboard =
+        Boolean(storyboardId) && storyboardId === input.storyboardId;
+      const assignCount = input.assignments.length;
+      const clearCount = input.assignments.filter((a) => a.voice === "").length;
+      const setCount = assignCount - clearCount;
+      const subtitle = `${assignCount} pack${assignCount === 1 ? "" : "s"} · ${setCount} set · ${clearCount} cleared${isOnTargetStoryboard ? "" : " · will navigate"}`;
+      const body =
+        (input.rationale ? `${input.rationale}\n\n` : "") +
+        input.assignments
+          .map(
+            (a) => `${a.packId} → ${a.voice === "" ? "(clear)" : a.voice}`,
+          )
+          .join("\n");
+
+      const applyAssignments = async (): Promise<{
+        applied: number;
+        failed: number;
+        error?: string;
+      }> => {
+        let applied = 0;
+        let failed = 0;
+        let firstError: string | undefined;
+        for (const assignment of input.assignments) {
+          try {
+            await setIdentityPackVoiceMutation({
+              storyboardId: input.storyboardId,
+              packId: assignment.packId,
+              voice: assignment.voice,
+            });
+            applied += 1;
+          } catch (err) {
+            failed += 1;
+            if (firstError === undefined) {
+              firstError =
+                err instanceof Error
+                  ? err.message
+                  : "setIdentityPackVoice mutation failed";
+            }
+          }
+        }
+        return { applied, failed, error: firstError };
+      };
+
+      return (
+        <ApprovalCard
+          title="Assign voice cast"
+          subtitle={subtitle}
+          body={body}
+          extra={<VoiceCastPreviewList assignments={input.assignments} />}
+          onApprove={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await applyAssignments();
+            await auditToolCall({
+              tool: "request_assign_voice_cast",
+              result: outcome.failed > 0 ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                assignCount,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+              },
+            });
+            if (outcome.failed > 0 && outcome.applied === 0) {
+              respond({
+                approved: false,
+                blockedReason:
+                  outcome.error ?? "All voice assignments failed.",
+              });
+            } else {
+              respond({
+                approved: true,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                assignments: input.assignments,
+              });
+            }
+          }}
+          onEdit={async () => {
+            if (!isOnTargetStoryboard) {
+              router.push(
+                `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+              );
+            }
+            const outcome = await applyAssignments();
+            await auditToolCall({
+              tool: "request_assign_voice_cast",
+              result: outcome.failed > 0 ? "blocked" : "success",
+              details: {
+                storyboardId: input.storyboardId,
+                assignCount,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                error: outcome.error,
+                navigated: !isOnTargetStoryboard,
+                edited: true,
+              },
+            });
+            if (outcome.failed > 0 && outcome.applied === 0) {
+              respond({
+                approved: false,
+                blockedReason:
+                  outcome.error ?? "All voice assignments failed.",
+              });
+            } else {
+              respond({
+                approved: true,
+                edited: true,
+                applied: outcome.applied,
+                failed: outcome.failed,
+                assignments: input.assignments,
+              });
+            }
+          }}
+          onReject={async () => {
+            await auditToolCall({
+              tool: "request_assign_voice_cast",
+              result: "blocked",
+              details: {
+                storyboardId: input.storyboardId,
+                assignCount,
+              },
+            });
+            respond({
+              approved: false,
+              blockedReason: "Producer rejected voice cast assignment.",
+            });
+          }}
+        />
+      );
+    },
+  });
+
   return (
     <>
       <CopilotActionRegistration name="propose_branch" />
@@ -2658,7 +4368,16 @@ export function StoryboardCopilotBridge({
       <CopilotActionRegistration name="request_generate_shot_batch" />
       <CopilotActionRegistration name="request_generate_shot_video_batch" />
       <CopilotActionRegistration name="request_generate_shot_audio_batch" />
+      <CopilotActionRegistration name="request_generate_shot_sfx_batch" />
+      <CopilotActionRegistration name="request_generate_score" />
+      <CopilotActionRegistration name="request_dailies_critic_review" />
+      <CopilotActionRegistration name="request_beat_assignment" />
+      <CopilotActionRegistration name="request_hook_variants" />
+      <CopilotActionRegistration name="request_structural_remix" />
+      <CopilotActionRegistration name="request_transition_proposal" />
+      <CopilotActionRegistration name="request_motif_plant" />
       <CopilotActionRegistration name="request_export_reel" />
+      <CopilotActionRegistration name="request_assign_voice_cast" />
       <CopilotSidebar
         defaultOpen={false}
         clickOutsideToClose
@@ -2731,6 +4450,7 @@ function ApprovalCard({
   title,
   subtitle,
   body,
+  extra,
   onApprove,
   onEdit,
   onReject,
@@ -2738,6 +4458,10 @@ function ApprovalCard({
   title: string;
   subtitle: string;
   body: string;
+  /** Optional React slot rendered between the prose body and the
+   *  Approve/Edit/Reject buttons. Used by the voice-cast card to
+   *  inject inline preview ▶ buttons; other callers omit it. */
+  extra?: React.ReactNode;
   onApprove: () => Promise<void>;
   onEdit: () => Promise<void>;
   onReject: () => Promise<void>;
@@ -2766,6 +4490,7 @@ function ApprovalCard({
       <h3 className="mt-1 text-sm font-semibold">{title}</h3>
       <p className="mt-1 text-xs text-zinc-400">{subtitle}</p>
       <p className="mt-3 text-xs text-zinc-300 whitespace-pre-wrap">{body}</p>
+      {extra ? <div className="mt-3">{extra}</div> : null}
       {error ? (
         <p className="mt-2 text-[11px] text-rose-300 whitespace-pre-wrap">
           {error}
@@ -2794,6 +4519,1056 @@ function ApprovalCard({
           Reject
         </button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * M9 Phase 3 — shared renderer for request_hook_variants and
+ * request_structural_remix HITL cards. Both tools have the same
+ * approval shape: the producer picks 0-N variants to commit, each one
+ * becomes its own narrative-git branch + commit + narrativeVariants
+ * row. Sharing the renderer keeps the commit flow (and audit shape)
+ * byte-identical between the two tools.
+ *
+ * UX: checkbox list of variants (Approve commits all checked; Edit is
+ * explicit "commit a subset"; Reject commits none). On approve or edit
+ * we walk the selected variants sequentially — each round-trip is a
+ * createBranch → commitPlanOps → upsertVariant triple. Sequential
+ * rather than parallel so the audit log reads top-to-bottom and any
+ * mid-stream failure short-circuits cleanly.
+ *
+ * The renderer is intentionally a siblings-stay strategy: siblings of
+ * a picked winner are NOT archived here; that happens later in
+ * Variant Compare when the producer runs applyMergePolicy. The 14-day
+ * cron then reaps whatever was never picked.
+ */
+type VariantProposalRendererProps = {
+  variantType: "hook" | "remix";
+  input: HookVariantInput | StructuralRemixInput | null;
+  args: unknown;
+  storyboardId: string | null;
+  safeStoryboardId: string;
+  respond: (payload: Record<string, unknown>) => void;
+  router: ReturnType<typeof useRouter>;
+  createApprovalTask: (input: {
+    storyboardId: string;
+    taskType: string;
+    title: string;
+    rationale: string;
+    diffSummary: string;
+    payloadJson: string;
+  }) => Promise<string>;
+  resolveApprovalTask: (input: {
+    taskId: string;
+    approved: boolean;
+    editedPayloadJson?: string;
+  }) => Promise<unknown>;
+  createBranch: (input: {
+    storyboardId: string;
+    branchId: string;
+    name: string;
+    parentBranchId?: string;
+    parentCommitId?: string;
+  }) => Promise<unknown>;
+  commitPlanOps: (input: {
+    storyboardId: string;
+    branchId: string;
+    title: string;
+    rationale?: string;
+    operations: HookVariantPlanOp[];
+    approvalToken: string;
+  }) => Promise<{ commitId: string } | unknown>;
+  upsertVariant: (input: {
+    storyboardId: string;
+    branchId: string;
+    variantType: "hook" | "structural" | "transition" | "remix";
+    rationale: string;
+    parentBranchId?: string;
+  }) => Promise<unknown>;
+  auditToolCall: (input: {
+    tool: string;
+    result: "success" | "failure" | "blocked";
+    details?: Record<string, unknown>;
+  }) => Promise<void>;
+};
+
+function VariantProposalRenderer(props: VariantProposalRendererProps) {
+  const {
+    variantType,
+    input,
+    args,
+    storyboardId,
+    respond,
+    router,
+    createApprovalTask,
+    resolveApprovalTask,
+    createBranch,
+    commitPlanOps,
+    upsertVariant,
+    auditToolCall,
+  } = props;
+  const toolName =
+    variantType === "hook" ? "request_hook_variants" : "request_structural_remix";
+
+  // Checkbox state for partial commits. Initialized to "all selected"
+  // so an uninspected Approve behaves as "commit everything", matching
+  // producer intuition; Edit lets them trim.
+  const variantIds: string[] = input?.variants.map((v) => v.variantId) ?? [];
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(variantIds),
+  );
+
+  if (!input || input.variants.length === 0) {
+    return (
+      <ToolStatusCard
+        name={toolName}
+        status="failed"
+        args={JSON.stringify(args ?? {}, null, 2)}
+        result={JSON.stringify({
+          error:
+            "Invalid variant payload: need storyboardId + at least one variant with non-empty planOps.",
+        })}
+      />
+    );
+  }
+
+  const isOnTargetStoryboard =
+    Boolean(storyboardId) && storyboardId === input.storyboardId;
+
+  const targetStructureLabel =
+    variantType === "remix"
+      ? (input as StructuralRemixInput).targetStructure.replace(/_/g, " ")
+      : "";
+
+  const subtitle = [
+    `${input.variantCount} variant${input.variantCount === 1 ? "" : "s"}`,
+    variantType === "remix" ? `target: ${targetStructureLabel}` : null,
+    `parent: ${input.parentBranchId}`,
+    isOnTargetStoryboard ? null : "will navigate",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const body =
+    (input.rationale ? `${input.rationale}\n\n` : "")
+    + input.variants
+      .map((v) => {
+        const tag =
+          variantType === "hook"
+            ? (v as HookVariantEntry).expectedRetention
+            : (v as StructuralRemixEntry).strategy;
+        const tagSuffix = tag ? ` · ${tag}` : "";
+        return `[${v.variantId}${tagSuffix}] ${v.rationale}`;
+      })
+      .join("\n");
+
+  // Build a unique branchId per variant. Shape mirrors the Python
+  // branchName format so traverse.ts + narrativeGit's existing
+  // branch-name conventions stay consistent.
+  const branchIdFor = (variantId: string): string =>
+    variantType === "hook"
+      ? `variant/hook-${variantId}`
+      : `variant/remix-${(input as StructuralRemixInput).targetStructure}-${variantId}`;
+
+  const commitSelected = async (
+    decision: "approve" | "edit",
+  ): Promise<{ committed: number; failed: number; error?: string }> => {
+    let committed = 0;
+    let failed = 0;
+    let firstError: string | undefined;
+    const keepIds = decision === "approve" ? new Set(variantIds) : selected;
+    for (const variant of input.variants) {
+      if (!keepIds.has(variant.variantId)) continue;
+      try {
+        const branchId = branchIdFor(variant.variantId);
+        // createBranch is idempotent — it returns the existing row's
+        // id when a branch with the same branchId is already present.
+        // That guards against double-click commits without adding a
+        // dedup layer on our side.
+        await createBranch({
+          storyboardId: input.storyboardId,
+          branchId,
+          name: variant.branchName,
+          parentBranchId: input.parentBranchId,
+        });
+        // Per-variant approval token. Using a synthetic task per
+        // variant rather than one task for the whole batch gives
+        // per-variant audit trail + lets a partial failure identify
+        // exactly which variant broke.
+        const taskId = await createApprovalTask({
+          storyboardId: input.storyboardId,
+          taskType:
+            variantType === "hook"
+              ? "hook_variant_commit"
+              : "structural_remix_commit",
+          title: `Commit ${variant.branchName}`,
+          rationale: variant.rationale || "Variant commit",
+          diffSummary: `${variant.planOps.length} ops`,
+          payloadJson: JSON.stringify(variant),
+        });
+        await resolveApprovalTask({
+          taskId,
+          approved: true,
+          editedPayloadJson:
+            decision === "edit" ? JSON.stringify(variant) : undefined,
+        });
+        await commitPlanOps({
+          storyboardId: input.storyboardId,
+          branchId,
+          title: variant.branchName,
+          rationale: variant.rationale,
+          operations: variant.planOps,
+          approvalToken: `approved:${taskId}`,
+        });
+        await upsertVariant({
+          storyboardId: input.storyboardId,
+          branchId,
+          variantType: variantType === "hook" ? "hook" : "remix",
+          rationale: variant.rationale,
+          parentBranchId: input.parentBranchId,
+        });
+        committed += 1;
+      } catch (err) {
+        failed += 1;
+        if (firstError === undefined) {
+          firstError =
+            err instanceof Error
+              ? err.message
+              : `Failed to commit variant ${variant.variantId}`;
+        }
+      }
+    }
+    return { committed, failed, error: firstError };
+  };
+
+  const extra = (
+    <div className="space-y-1">
+      {input.variants.map((v) => {
+        const isSelected = selected.has(v.variantId);
+        const tag =
+          variantType === "hook"
+            ? (v as HookVariantEntry).expectedRetention
+            : (v as StructuralRemixEntry).strategy;
+        return (
+          <label
+            key={v.variantId}
+            className="flex items-start gap-2 text-[11px] text-zinc-300 cursor-pointer"
+          >
+            <input
+              type="checkbox"
+              checked={isSelected}
+              onChange={(e) => {
+                const next = new Set(selected);
+                if (e.target.checked) {
+                  next.add(v.variantId);
+                } else {
+                  next.delete(v.variantId);
+                }
+                setSelected(next);
+              }}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              <span className="font-mono text-emerald-300">
+                {v.variantId}
+              </span>
+              {tag ? (
+                <span className="ml-1 text-zinc-500">[{tag}]</span>
+              ) : null}
+              <span className="ml-2 text-zinc-400">{v.branchName}</span>
+              <span className="ml-2 text-zinc-500">
+                {v.planOps.length} op{v.planOps.length === 1 ? "" : "s"}
+              </span>
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <ApprovalCard
+      title={
+        variantType === "hook"
+          ? `Commit ${input.variantCount} cold-open variant${input.variantCount === 1 ? "" : "s"}`
+          : `Commit ${input.variantCount} structural remix${input.variantCount === 1 ? "" : "es"} (${targetStructureLabel})`
+      }
+      subtitle={subtitle}
+      body={body}
+      extra={extra}
+      onApprove={async () => {
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const outcome = await commitSelected("approve");
+        await auditToolCall({
+          tool: toolName,
+          result: outcome.failed > 0 ? "blocked" : "success",
+          details: {
+            storyboardId: input.storyboardId,
+            parentBranchId: input.parentBranchId,
+            variantCount: input.variantCount,
+            committed: outcome.committed,
+            failed: outcome.failed,
+            error: outcome.error,
+            variantType,
+            targetStructure:
+              variantType === "remix"
+                ? (input as StructuralRemixInput).targetStructure
+                : undefined,
+          },
+        });
+        if (outcome.failed > 0 && outcome.committed === 0) {
+          respond({
+            approved: false,
+            blockedReason:
+              outcome.error ?? "All variant commits failed.",
+          });
+        } else {
+          respond({
+            approved: true,
+            variantType,
+            committed: outcome.committed,
+            failed: outcome.failed,
+          });
+        }
+      }}
+      onEdit={async () => {
+        if (selected.size === 0) {
+          await auditToolCall({
+            tool: toolName,
+            result: "blocked",
+            details: {
+              storyboardId: input.storyboardId,
+              variantCount: input.variantCount,
+              edited: true,
+              reason: "edit_with_zero_selected",
+            },
+          });
+          respond({
+            approved: false,
+            edited: true,
+            blockedReason:
+              "Edit submitted with no variants selected — treat as reject.",
+          });
+          return;
+        }
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const outcome = await commitSelected("edit");
+        await auditToolCall({
+          tool: toolName,
+          result: outcome.failed > 0 ? "blocked" : "success",
+          details: {
+            storyboardId: input.storyboardId,
+            parentBranchId: input.parentBranchId,
+            variantCount: input.variantCount,
+            selectedCount: selected.size,
+            committed: outcome.committed,
+            failed: outcome.failed,
+            error: outcome.error,
+            variantType,
+            edited: true,
+          },
+        });
+        if (outcome.failed > 0 && outcome.committed === 0) {
+          respond({
+            approved: false,
+            edited: true,
+            blockedReason:
+              outcome.error ?? "All selected variant commits failed.",
+          });
+        } else {
+          respond({
+            approved: true,
+            edited: true,
+            variantType,
+            committed: outcome.committed,
+            failed: outcome.failed,
+            selectedVariantIds: Array.from(selected),
+          });
+        }
+      }}
+      onReject={async () => {
+        await auditToolCall({
+          tool: toolName,
+          result: "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            variantCount: input.variantCount,
+            variantType,
+          },
+        });
+        respond({
+          approved: false,
+          blockedReason: `Producer rejected ${variantType === "hook" ? "cold-open" : "structural remix"} variants.`,
+        });
+      }}
+    />
+  );
+}
+
+/**
+ * M9 Phase 4 — TransitionProposalRenderer.
+ *
+ * Pick-one radio UX. The producer sees 2-4 ranked proposals; radio
+ * selects one; Approve commits that choice. Edit flows exactly like
+ * Approve but tags the audit as edited; useful when the producer
+ * picks rank-2 over the agent's top recommendation. Reject abstains.
+ *
+ * Commit steps on approve/edit:
+ *   1. Locate the edge (sourceNodeId → targetNodeId) in the bridge's
+ *      current `edges` list. If missing, fail fast — the edge has to
+ *      exist for a transition intent to land.
+ *   2. Commit the chosen proposal's planOps (motif plant + shot
+ *      additions) if present, via commitPlanOps.
+ *   3. Patch transitionIntent on the edge via
+ *      setEdgeTransitionIntent.
+ */
+type TransitionProposalRendererProps = {
+  input: TransitionProposalInput | null;
+  args: unknown;
+  storyboardId: string | null;
+  safeStoryboardId: string;
+  edges: StoryEdge[];
+  respond: (payload: Record<string, unknown>) => void;
+  router: ReturnType<typeof useRouter>;
+  createApprovalTask: (input: {
+    storyboardId: string;
+    taskType: string;
+    title: string;
+    rationale: string;
+    diffSummary: string;
+    payloadJson: string;
+  }) => Promise<string>;
+  resolveApprovalTask: (input: {
+    taskId: string;
+    approved: boolean;
+    editedPayloadJson?: string;
+  }) => Promise<unknown>;
+  commitPlanOps: (input: {
+    storyboardId: string;
+    branchId: string;
+    title: string;
+    rationale?: string;
+    operations: HookVariantPlanOp[];
+    approvalToken: string;
+  }) => Promise<unknown>;
+  setEdgeTransitionIntent: (input: {
+    storyboardId: string;
+    edgeId: string;
+    transitionIntent: string | null;
+  }) => Promise<unknown>;
+  auditToolCall: (input: {
+    tool: string;
+    result: "success" | "failure" | "blocked";
+    details?: Record<string, unknown>;
+  }) => Promise<void>;
+};
+
+function TransitionProposalRenderer(props: TransitionProposalRendererProps) {
+  const {
+    input,
+    args,
+    storyboardId,
+    edges,
+    respond,
+    router,
+    createApprovalTask,
+    resolveApprovalTask,
+    commitPlanOps,
+    setEdgeTransitionIntent,
+    auditToolCall,
+  } = props;
+
+  // Initial selection = rank-1 proposal (the recommended one) which is
+  // at index 0 after the Python tool's server-side sort.
+  const [selectedIntent, setSelectedIntent] = useState<string>(
+    () => input?.proposals[0]?.intent ?? "",
+  );
+
+  if (!input || input.proposals.length === 0) {
+    return (
+      <ToolStatusCard
+        name="request_transition_proposal"
+        status="failed"
+        args={JSON.stringify(args ?? {}, null, 2)}
+        result={JSON.stringify({
+          error:
+            "Invalid transition payload: need sourceNodeId + targetNodeId + at least one proposal.",
+        })}
+      />
+    );
+  }
+
+  // Find the edge now so the approval card can warn the producer if
+  // no connection exists yet. We match by (source, target) regardless
+  // of direction since the producer may have authored the edge with
+  // either orientation.
+  const matchedEdge = edges.find(
+    (e) =>
+      (e.source === input.sourceNodeId && e.target === input.targetNodeId)
+      || (e.source === input.targetNodeId && e.target === input.sourceNodeId),
+  );
+  const edgeIdForCommit = matchedEdge?.id ?? "";
+
+  const isOnTargetStoryboard =
+    Boolean(storyboardId) && storyboardId === input.storyboardId;
+
+  const subtitle = [
+    `${input.sourceNodeId} → ${input.targetNodeId}`,
+    `${input.proposalCount} proposal${input.proposalCount === 1 ? "" : "s"}`,
+    matchedEdge ? `edge ${matchedEdge.id.slice(0, 8)}` : "no edge (blocks)",
+    isOnTargetStoryboard ? null : "will navigate",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const body =
+    (input.rationale ? `${input.rationale}\n\n` : "")
+    + input.proposals
+      .map((p) => {
+        const rankPrefix = p.rank ? `#${p.rank} ` : "";
+        const sharedSuffix = p.sharedElement ? ` — shared: ${p.sharedElement}` : "";
+        const warnSuffix =
+          p.rawIntent && p.rawIntent !== p.intent
+            ? ` (normalized from '${p.rawIntent}')`
+            : "";
+        return `${rankPrefix}[${p.intent}]${warnSuffix}${sharedSuffix}\n${p.rationale ?? ""}`;
+      })
+      .join("\n\n");
+
+  const commitChosen = async (
+    decision: "approve" | "edit",
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!matchedEdge) {
+      return {
+        ok: false,
+        error: `No edge between ${input.sourceNodeId} and ${input.targetNodeId}. Connect the nodes before applying a transition.`,
+      };
+    }
+    const chosen = input.proposals.find((p) => p.intent === selectedIntent);
+    if (!chosen) {
+      return { ok: false, error: "No proposal selected." };
+    }
+    try {
+      const taskId = await createApprovalTask({
+        storyboardId: input.storyboardId,
+        taskType: "transition_proposal",
+        title: `${chosen.intent} between ${input.sourceNodeId} + ${input.targetNodeId}`,
+        rationale: chosen.rationale ?? "Transition intent approved",
+        diffSummary: `transitionIntent=${chosen.intent}`,
+        payloadJson: JSON.stringify({ ...input, selectedIntent }),
+      });
+      await resolveApprovalTask({
+        taskId,
+        approved: true,
+        editedPayloadJson:
+          decision === "edit"
+            ? JSON.stringify({ ...input, selectedIntent })
+            : undefined,
+      });
+      if (chosen.planOps && chosen.planOps.length > 0) {
+        await commitPlanOps({
+          storyboardId: input.storyboardId,
+          branchId: input.branchId,
+          title: `Transition plant: ${chosen.intent}`,
+          rationale: chosen.rationale,
+          operations: chosen.planOps,
+          approvalToken: `approved:${taskId}`,
+        });
+      }
+      await setEdgeTransitionIntent({
+        storyboardId: input.storyboardId,
+        edgeId: edgeIdForCommit,
+        transitionIntent: chosen.intent,
+      });
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        error:
+          err instanceof Error
+            ? err.message
+            : "Failed to apply transition proposal.",
+      };
+    }
+  };
+
+  const extra = (
+    <div className="space-y-1">
+      {input.proposals.map((p) => {
+        const isSelected = selectedIntent === p.intent;
+        return (
+          <label
+            key={`${p.intent}-${p.rank ?? ""}`}
+            className="flex items-start gap-2 text-[11px] text-zinc-300 cursor-pointer"
+          >
+            <input
+              type="radio"
+              name="transition-pick"
+              checked={isSelected}
+              onChange={() => setSelectedIntent(p.intent)}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              {p.rank ? (
+                <span className="mr-1 text-zinc-500">#{p.rank}</span>
+              ) : null}
+              <span className="font-mono text-emerald-300">{p.intent}</span>
+              {p.sharedElement ? (
+                <span className="ml-2 text-zinc-400">
+                  shared: {p.sharedElement}
+                </span>
+              ) : null}
+              {p.planOps && p.planOps.length > 0 ? (
+                <span className="ml-2 text-amber-300">
+                  {p.planOps.length} op{p.planOps.length === 1 ? "" : "s"}
+                </span>
+              ) : null}
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <ApprovalCard
+      title={`Transition: ${input.sourceNodeId} → ${input.targetNodeId}`}
+      subtitle={subtitle}
+      body={body}
+      extra={extra}
+      onApprove={async () => {
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const result = await commitChosen("approve");
+        await auditToolCall({
+          tool: "request_transition_proposal",
+          result: result.ok ? "success" : "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            sourceNodeId: input.sourceNodeId,
+            targetNodeId: input.targetNodeId,
+            selectedIntent,
+            edgeId: edgeIdForCommit || undefined,
+            error: result.error,
+          },
+        });
+        if (result.ok) {
+          respond({ approved: true, selectedIntent, edgeId: edgeIdForCommit });
+        } else {
+          respond({
+            approved: false,
+            blockedReason: result.error ?? "Transition commit failed.",
+          });
+        }
+      }}
+      onEdit={async () => {
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const result = await commitChosen("edit");
+        await auditToolCall({
+          tool: "request_transition_proposal",
+          result: result.ok ? "success" : "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            sourceNodeId: input.sourceNodeId,
+            targetNodeId: input.targetNodeId,
+            selectedIntent,
+            edited: true,
+            error: result.error,
+          },
+        });
+        if (result.ok) {
+          respond({
+            approved: true,
+            edited: true,
+            selectedIntent,
+            edgeId: edgeIdForCommit,
+          });
+        } else {
+          respond({
+            approved: false,
+            edited: true,
+            blockedReason: result.error ?? "Transition commit failed.",
+          });
+        }
+      }}
+      onReject={async () => {
+        await auditToolCall({
+          tool: "request_transition_proposal",
+          result: "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            sourceNodeId: input.sourceNodeId,
+            targetNodeId: input.targetNodeId,
+          },
+        });
+        respond({
+          approved: false,
+          blockedReason: "Producer rejected transition proposals.",
+        });
+      }}
+    />
+  );
+}
+
+/**
+ * M9 Phase 4 — MotifPlantRenderer.
+ *
+ * Single-target plant. The approval card surfaces motifKey, target
+ * node, visual vocabulary, and the planOps to apply. On approve:
+ *   1. Commit the planOps (typically a single update_node op that
+ *      appends motifKey to the target's motifIds[]).
+ *   2. Upsert the narrativeMotifs row — Convex derives landedStatus
+ *      from sources/payoffs presence so the bridge doesn't guess.
+ *
+ * The upsertMotif mutation requires an explicit landedStatus; we
+ * compute it client-side so the producer sees the exact status that
+ * will land in the database (matching Convex's derivation rule).
+ */
+type MotifPlantRendererProps = {
+  input: MotifPlantInput | null;
+  args: unknown;
+  storyboardId: string | null;
+  safeStoryboardId: string;
+  respond: (payload: Record<string, unknown>) => void;
+  router: ReturnType<typeof useRouter>;
+  createApprovalTask: TransitionProposalRendererProps["createApprovalTask"];
+  resolveApprovalTask: TransitionProposalRendererProps["resolveApprovalTask"];
+  commitPlanOps: TransitionProposalRendererProps["commitPlanOps"];
+  upsertMotif: (input: {
+    storyboardId: string;
+    motifKey: string;
+    description: string;
+    sourceNodeIds: string[];
+    payoffNodeIds: string[];
+    visualVocabulary?: string;
+    landedStatus: "unplanted" | "planted" | "landed";
+  }) => Promise<unknown>;
+  auditToolCall: TransitionProposalRendererProps["auditToolCall"];
+};
+
+function MotifPlantRenderer(props: MotifPlantRendererProps) {
+  const {
+    input,
+    args,
+    storyboardId,
+    respond,
+    router,
+    createApprovalTask,
+    resolveApprovalTask,
+    commitPlanOps,
+    upsertMotif,
+    auditToolCall,
+  } = props;
+
+  if (!input) {
+    return (
+      <ToolStatusCard
+        name="request_motif_plant"
+        status="failed"
+        args={JSON.stringify(args ?? {}, null, 2)}
+        result={JSON.stringify({
+          error:
+            "Invalid motif plant payload: need storyboardId + motifKey + targetNodeId.",
+        })}
+      />
+    );
+  }
+
+  const isOnTargetStoryboard =
+    Boolean(storyboardId) && storyboardId === input.storyboardId;
+
+  // Derive the landedStatus the row will get if the producer approves.
+  // The rule mirrors detect_motif_gaps on the agent side: both arrays
+  // present → landed, sources only → planted, payoffs only → orphaned
+  // (Convex schema uses "planted" for the orphan case too since
+  // landedStatus enum is {unplanted, planted, landed}; the panel
+  // distinguishes via sources/payoffs presence).
+  const derivedStatus: "unplanted" | "planted" | "landed" =
+    input.sourceNodeIds.length > 0 && input.payoffNodeIds.length > 0
+      ? "landed"
+      : input.sourceNodeIds.length > 0 || input.payoffNodeIds.length > 0
+        ? "planted"
+        : "unplanted";
+
+  const subtitle = [
+    `motif ${input.motifKey}`,
+    `target ${input.targetNodeId}`,
+    `status → ${derivedStatus}`,
+    `${input.planOps.length} op${input.planOps.length === 1 ? "" : "s"}`,
+    isOnTargetStoryboard ? null : "will navigate",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const body = [
+    input.rationale,
+    input.description ? `Description: ${input.description}` : "",
+    input.visualVocabulary
+      ? `Visual vocabulary: ${input.visualVocabulary}`
+      : "",
+    input.sourceNodeIds.length > 0
+      ? `Plants: ${input.sourceNodeIds.join(", ")}`
+      : "",
+    input.payoffNodeIds.length > 0
+      ? `Payoffs: ${input.payoffNodeIds.join(", ")}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const applyPlant = async (
+    decision: "approve" | "edit",
+  ): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const taskId = await createApprovalTask({
+        storyboardId: input.storyboardId,
+        taskType: "motif_plant",
+        title: `Plant motif ${input.motifKey} at ${input.targetNodeId}`,
+        rationale: input.rationale || "Motif plant approved",
+        diffSummary: `motif=${input.motifKey} status=${derivedStatus}`,
+        payloadJson: JSON.stringify(input),
+      });
+      await resolveApprovalTask({
+        taskId,
+        approved: true,
+        editedPayloadJson:
+          decision === "edit" ? JSON.stringify(input) : undefined,
+      });
+      if (input.planOps.length > 0) {
+        await commitPlanOps({
+          storyboardId: input.storyboardId,
+          branchId: input.branchId,
+          title: `Plant ${input.motifKey} at ${input.targetNodeId}`,
+          rationale: input.rationale,
+          operations: input.planOps,
+          approvalToken: `approved:${taskId}`,
+        });
+      }
+      await upsertMotif({
+        storyboardId: input.storyboardId,
+        motifKey: input.motifKey,
+        description: input.description,
+        sourceNodeIds: input.sourceNodeIds,
+        payoffNodeIds: input.payoffNodeIds,
+        visualVocabulary: input.visualVocabulary || undefined,
+        landedStatus: derivedStatus,
+      });
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        error:
+          err instanceof Error
+            ? err.message
+            : "Failed to apply motif plant.",
+      };
+    }
+  };
+
+  return (
+    <ApprovalCard
+      title={`Plant motif: ${input.motifKey}`}
+      subtitle={subtitle}
+      body={body}
+      onApprove={async () => {
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const result = await applyPlant("approve");
+        await auditToolCall({
+          tool: "request_motif_plant",
+          result: result.ok ? "success" : "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            motifKey: input.motifKey,
+            targetNodeId: input.targetNodeId,
+            derivedStatus,
+            planOpCount: input.planOps.length,
+            error: result.error,
+          },
+        });
+        if (result.ok) {
+          respond({
+            approved: true,
+            motifKey: input.motifKey,
+            landedStatus: derivedStatus,
+          });
+        } else {
+          respond({
+            approved: false,
+            blockedReason: result.error ?? "Motif plant failed.",
+          });
+        }
+      }}
+      onEdit={async () => {
+        if (!isOnTargetStoryboard) {
+          router.push(
+            `/storyboard/${encodeURIComponent(input.storyboardId)}`,
+          );
+        }
+        const result = await applyPlant("edit");
+        await auditToolCall({
+          tool: "request_motif_plant",
+          result: result.ok ? "success" : "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            motifKey: input.motifKey,
+            targetNodeId: input.targetNodeId,
+            derivedStatus,
+            edited: true,
+            error: result.error,
+          },
+        });
+        if (result.ok) {
+          respond({
+            approved: true,
+            edited: true,
+            motifKey: input.motifKey,
+            landedStatus: derivedStatus,
+          });
+        } else {
+          respond({
+            approved: false,
+            edited: true,
+            blockedReason: result.error ?? "Motif plant failed.",
+          });
+        }
+      }}
+      onReject={async () => {
+        await auditToolCall({
+          tool: "request_motif_plant",
+          result: "blocked",
+          details: {
+            storyboardId: input.storyboardId,
+            motifKey: input.motifKey,
+            targetNodeId: input.targetNodeId,
+          },
+        });
+        respond({
+          approved: false,
+          blockedReason: "Producer rejected motif plant.",
+        });
+      }}
+    />
+  );
+}
+
+/**
+ * M6 polish — inline voice preview list for the request_assign_voice_cast
+ * approval card. Each assignment gets a ▶ button that hits
+ * /api/media/preview-voice for the proposed voice and plays the returned
+ * mp3 sample, so the producer can audition before approving the whole
+ * batch. Mirrors the ContinuityOSPanel row preview, but the list layout
+ * accommodates N rows instead of the single-pack dropdown.
+ */
+function VoiceCastPreviewList({
+  assignments,
+}: {
+  assignments: VoiceCastAssignment[];
+}) {
+  const [busyVoice, setBusyVoice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      audio.pause();
+      if (audio.src.startsWith("blob:")) {
+        URL.revokeObjectURL(audio.src);
+      }
+    };
+  }, []);
+
+  const playPreview = async (voice: string) => {
+    if (!voice) return;
+    setError(null);
+    setBusyVoice(voice);
+    try {
+      const res = await fetch(
+        `/api/media/preview-voice?voice=${encodeURIComponent(voice)}`,
+        { method: "GET", cache: "no-store" },
+      );
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "");
+        throw new Error(
+          `preview ${res.status}: ${msg.slice(0, 160) || "unknown error"}`,
+        );
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const prev = audioRef.current;
+      if (prev) {
+        prev.pause();
+        if (prev.src.startsWith("blob:")) URL.revokeObjectURL(prev.src);
+      }
+      const audio = prev ?? new Audio();
+      audioRef.current = audio;
+      audio.src = url;
+      await audio.play();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "preview failed");
+    } finally {
+      setBusyVoice(null);
+    }
+  };
+
+  return (
+    <div className="rounded border border-zinc-800 bg-zinc-900/50 p-2">
+      <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+        Audition each proposed voice
+      </p>
+      <ul className="mt-1 space-y-1">
+        {assignments.map((a) => (
+          <li
+            key={`${a.packId}_${a.voice}`}
+            className="flex items-center justify-between gap-2 text-[11px]"
+          >
+            <span className="truncate text-zinc-300">
+              <span className="font-mono text-zinc-500">{a.packId}</span>
+              <span className="mx-1 text-zinc-500">→</span>
+              <span>{a.voice === "" ? "(clear)" : a.voice}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => void playPreview(a.voice)}
+              disabled={!a.voice || busyVoice !== null}
+              className="shrink-0 rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[10px] text-zinc-200 disabled:opacity-40"
+              title={
+                a.voice
+                  ? `Play a sample of "${a.voice}"`
+                  : "No voice to preview (clear action)"
+              }
+            >
+              {busyVoice === a.voice ? "…" : "▶"}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {error ? (
+        <p className="mt-1 text-[10px] text-rose-400" title={error}>
+          preview failed: {error}
+        </p>
+      ) : null}
     </div>
   );
 }

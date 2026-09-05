@@ -1,0 +1,101 @@
+name: Pre-release / Playwright E2E
+
+# Runs the full L6 Playwright suite against staging Convex + a real
+# LLM before promoting a release/* branch. Cost: ~$5 per run
+# (browser + LLM + ffmpeg). Time budget: <15 minutes.
+#
+# Triggered by:
+#   * push to release/* branches (pre-release gate)
+#   * manual workflow_dispatch (debug runs)
+#
+# The narrative-analysis spec runs without a live LLM (deterministic
+# heuristics); LLM-driven specs (variants, transitions, motifs,
+# batches) require E2E_OPENAI_API_KEY set as a secret. Specs gracefully
+# auto-skip when their preconditions aren't met.
+
+on:
+  push:
+    branches: ["release/*"]
+  workflow_dispatch:
+    inputs:
+      spec_filter:
+        description: "Optional spec filter (e.g. director-narrative-analysis)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: L6 — Playwright E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dreamweaver-frontend
+    env:
+      # Staging targets. CI must set these as repo secrets / vars
+      # for the workflow to do anything meaningful.
+      E2E_STAGING_URL: ${{ vars.E2E_STAGING_URL }}
+      E2E_CONVEX_URL: ${{ vars.E2E_CONVEX_URL }}
+      NEXT_PUBLIC_CONVEX_SITE_URL: ${{ vars.E2E_CONVEX_SITE_URL }}
+      E2E_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_E2E }}
+      # Test user credentials — the seed user must already exist on
+      # the staging Convex deployment. If it doesn't, the mint
+      # script creates it on first call.
+      E2E_TEST_USER_EMAIL: ${{ vars.E2E_TEST_USER_EMAIL }}
+      E2E_TEST_USER_PASSWORD: ${{ secrets.E2E_TEST_USER_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright (Chromium)
+        run: bun run test:e2e:install
+
+      - name: Mint e2e session token
+        # Eval-able output → exports E2E_AUTH_SESSION_TOKEN +
+        # E2E_AUTH_CONVEX_JWT. The JWT is 15-min lived; if the
+        # subsequent e2e step takes longer than that, individual
+        # specs will fail their first Convex call. The seeded-
+        # storyboard fixture is the most likely victim — for now,
+        # the e2e suite is sized to stay under that window.
+        run: |
+          set -e
+          MINT_OUTPUT=$(bun run scripts/mint-e2e-session.ts)
+          # Persist the exports so subsequent steps see them.
+          echo "$MINT_OUTPUT" | grep -E "^export" \
+            | sed 's/^export //; s/=/=/' >> "$GITHUB_ENV"
+          # Drop the literal `'`s from the exported lines.
+          sed -i.bak "s/'//g" "$GITHUB_ENV"
+
+      - name: Run Playwright suite
+        run: |
+          if [ -n "${{ inputs.spec_filter }}" ]; then
+            bun run test:e2e -- "${{ inputs.spec_filter }}"
+          else
+            bun run test:e2e
+          fi
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: dreamweaver-frontend/playwright-report/
+          retention-days: 14
+
+      - name: Upload traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: dreamweaver-frontend/test-results/
+          retention-days: 14

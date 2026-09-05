@@ -45,7 +45,13 @@ export const createMediaAsset = mutation({
   args: {
     storyboardId: v.id("storyboards"),
     nodeId: v.string(),
-    kind: v.union(v.literal("image"), v.literal("video"), v.literal("audio")),
+    kind: v.union(
+      v.literal("image"),
+      v.literal("video"),
+      v.literal("audio"),
+      v.literal("sfx"),
+      v.literal("score"),
+    ),
     sourceUrl: v.string(),
     modelId: v.string(),
     prompt: v.string(),
@@ -92,6 +98,9 @@ export const createMediaAsset = mutation({
         url: args.sourceUrl,
         modelId: args.modelId,
         createdAt: now,
+        // Propagate metadata (e.g. SFX volumeDb) onto the variant so
+        // the reel export can read it without a second Convex fetch.
+        ...(args.metadata ? { metadata: args.metadata } : {}),
       };
       const nextImages =
         args.kind === "image" ? [...node.media.images, variant] : node.media.images;
@@ -100,15 +109,20 @@ export const createMediaAsset = mutation({
       const existingAudios = node.media.audios ?? [];
       const nextAudios =
         args.kind === "audio" ? [...existingAudios, variant] : existingAudios;
+      const existingSfxs = node.media.sfxs ?? [];
+      const nextSfxs =
+        args.kind === "sfx" ? [...existingSfxs, variant] : existingSfxs;
 
       await ctx.db.patch(node._id, {
         media: {
           images: nextImages,
           videos: nextVideos,
           audios: nextAudios,
+          sfxs: nextSfxs,
           activeImageId: args.kind === "image" ? assetId : node.media.activeImageId,
           activeVideoId: args.kind === "video" ? assetId : node.media.activeVideoId,
           activeAudioId: args.kind === "audio" ? assetId : node.media.activeAudioId,
+          activeSfxId: args.kind === "sfx" ? assetId : node.media.activeSfxId,
         },
         updatedAt: now,
       });
@@ -134,7 +148,13 @@ export const startMediaGeneration = mutation({
   args: {
     storyboardId: v.id("storyboards"),
     nodeId: v.string(),
-    kind: v.union(v.literal("image"), v.literal("video"), v.literal("audio")),
+    kind: v.union(
+      v.literal("image"),
+      v.literal("video"),
+      v.literal("audio"),
+      v.literal("sfx"),
+      v.literal("score"),
+    ),
     modelId: v.string(),
     prompt: v.string(),
     negativePrompt: v.optional(v.string()),
@@ -179,6 +199,13 @@ export const completeMediaGeneration = mutation({
       v.union(v.literal("matching"), v.literal("deviation"), v.literal("unknown")),
     ),
     metadata: v.optional(v.record(v.string(), v.string())),
+    /** M8 — when true, the completion writes the sourceUrl onto the
+     *  asset row but SKIPS patching the node's media variant arrays.
+     *  Used by the multi-locale narration pipeline: we want a
+     *  separate asset per dubbed locale but we don't want the dub
+     *  to replace the source-language `activeAudioId`. The asset is
+     *  linked to the shot via the `localeNarrations` table instead. */
+    skipNodePatch: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     const userId = await requireUser(ctx);
@@ -206,12 +233,14 @@ export const completeMediaGeneration = mutation({
       updatedAt: now,
     });
 
-    const node = await ctx.db
-      .query("storyboardNodes")
-      .withIndex("by_storyboard_node", (q) =>
-        q.eq("storyboardId", asset.storyboardId).eq("nodeId", asset.nodeId),
-      )
-      .unique();
+    const node = args.skipNodePatch
+      ? null
+      : await ctx.db
+          .query("storyboardNodes")
+          .withIndex("by_storyboard_node", (q) =>
+            q.eq("storyboardId", asset.storyboardId).eq("nodeId", asset.nodeId),
+          )
+          .unique();
     if (node) {
       const effectiveModelId = args.modelId ?? asset.modelId;
       const variant = {
@@ -219,6 +248,9 @@ export const completeMediaGeneration = mutation({
         url: args.sourceUrl,
         modelId: effectiveModelId,
         createdAt: now,
+        // See createMediaAsset — metadata flows onto the variant so
+        // downstream readers (reel export) don't need an extra fetch.
+        ...(args.metadata ? { metadata: args.metadata } : {}),
       };
       const nextImages =
         asset.kind === "image" ? [...node.media.images, variant] : node.media.images;
@@ -227,18 +259,24 @@ export const completeMediaGeneration = mutation({
       const existingAudios = node.media.audios ?? [];
       const nextAudios =
         asset.kind === "audio" ? [...existingAudios, variant] : existingAudios;
+      const existingSfxs = node.media.sfxs ?? [];
+      const nextSfxs =
+        asset.kind === "sfx" ? [...existingSfxs, variant] : existingSfxs;
 
       await ctx.db.patch(node._id, {
         media: {
           images: nextImages,
           videos: nextVideos,
           audios: nextAudios,
+          sfxs: nextSfxs,
           activeImageId:
             asset.kind === "image" ? args.mediaAssetId : node.media.activeImageId,
           activeVideoId:
             asset.kind === "video" ? args.mediaAssetId : node.media.activeVideoId,
           activeAudioId:
             asset.kind === "audio" ? args.mediaAssetId : node.media.activeAudioId,
+          activeSfxId:
+            asset.kind === "sfx" ? args.mediaAssetId : node.media.activeSfxId,
         },
         updatedAt: now,
       });
@@ -446,12 +484,22 @@ export const setActiveMediaVariant = mutation({
       throw new ConvexError("Node or media asset not found");
     }
 
+    // Spread `node.media` and override only the active id for the
+    // matching kind. The previous shape of this patch omitted
+    // `audios` / `sfxs` / their active ids — a latent bug that wiped
+    // narration + SFX attachments when a producer swapped an image
+    // or video variant. Keep every field; mutate one.
     await ctx.db.patch(node._id, {
       media: {
-        images: node.media.images,
-        videos: node.media.videos,
-        activeImageId: asset.kind === "image" ? args.mediaAssetId : node.media.activeImageId,
-        activeVideoId: asset.kind === "video" ? args.mediaAssetId : node.media.activeVideoId,
+        ...node.media,
+        activeImageId:
+          asset.kind === "image" ? args.mediaAssetId : node.media.activeImageId,
+        activeVideoId:
+          asset.kind === "video" ? args.mediaAssetId : node.media.activeVideoId,
+        activeAudioId:
+          asset.kind === "audio" ? args.mediaAssetId : node.media.activeAudioId,
+        activeSfxId:
+          asset.kind === "sfx" ? args.mediaAssetId : node.media.activeSfxId,
       },
       updatedAt: Date.now(),
     });
@@ -515,11 +563,126 @@ export const setTakeStatus = mutation({
   },
 });
 
+/**
+ * M7 — update the volume (in dB) of an SFX media asset. Scoped
+ * narrowly to `kind === "sfx"` so callers can't repurpose this
+ * endpoint to mangle metadata on narration / image / video rows.
+ *
+ * The value is persisted in the asset's `metadata.volumeDb` slot as
+ * a string (Convex's `v.record(v.string(), v.string())` shape). The
+ * reel-export pipeline reads it back when pre-mixing the SFX under
+ * narration; see the export-reel route for the read side.
+ */
+export const setSfxVolume = mutation({
+  args: {
+    mediaAssetId: v.id("mediaAssets"),
+    volumeDb: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const userId = await requireUser(ctx);
+    const asset = await ctx.db.get(args.mediaAssetId);
+    if (!asset) {
+      throw new ConvexError("Media asset not found");
+    }
+    if (asset.kind !== "sfx") {
+      throw new ConvexError(
+        `setSfxVolume: asset kind is "${asset.kind}" (expected "sfx")`,
+      );
+    }
+    await ensureStoryboardEditable(ctx, asset.storyboardId, userId);
+    // Clamp to the SFX window. Mirrors the constants in
+    // `src/lib/sfx/index.ts` — duplicating them here avoids a
+    // client-library import into Convex functions (which run on a
+    // different bundle).
+    const clampedVolume = Math.max(-40, Math.min(0, args.volumeDb));
+    const nextMetadata = {
+      ...(asset.metadata ?? {}),
+      volumeDb: String(clampedVolume),
+    };
+    const now = Date.now();
+    await ctx.db.patch(args.mediaAssetId, {
+      metadata: nextMetadata,
+      updatedAt: now,
+    });
+
+    // Also patch the matching variant on the node so the reel-manifest
+    // reads consistent metadata (the manifest never fetches individual
+    // mediaAssets, only reads the node's media variant arrays).
+    const node = await ctx.db
+      .query("storyboardNodes")
+      .withIndex("by_storyboard_node", (q) =>
+        q.eq("storyboardId", asset.storyboardId).eq("nodeId", asset.nodeId),
+      )
+      .unique();
+    if (node) {
+      const existingSfxs = node.media.sfxs ?? [];
+      const nextSfxs = existingSfxs.map((variant) =>
+        variant.mediaAssetId === args.mediaAssetId
+          ? { ...variant, metadata: nextMetadata }
+          : variant,
+      );
+      await ctx.db.patch(node._id, {
+        media: {
+          ...node.media,
+          sfxs: nextSfxs,
+        },
+        updatedAt: now,
+      });
+    }
+    return { mediaAssetId: args.mediaAssetId, volumeDb: clampedVolume };
+  },
+});
+
+/** Read the SFX-specific metadata off a media asset. Narrow to `sfx`
+ *  kind so the route/UI can trust the shape. Returns null when the
+ *  asset doesn't exist or isn't SFX — callers default to library
+ *  constants (DEFAULT_SFX_VOLUME_DB) in that case. */
+export const getSfxAssetMetadata = query({
+  args: { mediaAssetId: v.id("mediaAssets") },
+  handler: async (ctx, args) => {
+    const userId = await requireUser(ctx);
+    const asset = await ctx.db.get(args.mediaAssetId);
+    if (!asset) return null;
+    if (asset.kind !== "sfx") return null;
+    await ensureStoryboardEditable(ctx, asset.storyboardId, userId);
+    const metadata = asset.metadata ?? {};
+    const volumeStr = metadata.volumeDb;
+    const volumeNum =
+      typeof volumeStr === "string" && volumeStr.trim().length > 0
+        ? Number(volumeStr)
+        : undefined;
+    return {
+      mediaAssetId: args.mediaAssetId,
+      prompt: asset.prompt,
+      modelId: asset.modelId,
+      sourceUrl: asset.sourceUrl,
+      volumeDb:
+        typeof volumeNum === "number" && Number.isFinite(volumeNum)
+          ? volumeNum
+          : null,
+      durationS:
+        typeof metadata.durationS === "string"
+          ? Number(metadata.durationS)
+          : null,
+    };
+  },
+});
+
 export const listNodeMedia = query({
   args: {
     storyboardId: v.id("storyboards"),
     nodeId: v.string(),
-    kind: v.optional(v.union(v.literal("image"), v.literal("video"))),
+    // M7 — widened to include audio + sfx so the PropertiesPanel's
+    // SFX / narration variant pickers can share this one query.
+    // M8 — score support too so the ReelScorePanel's variants picker
+    // can list historical takes for a storyboard.
+    kind: v.optional(v.union(
+      v.literal("image"),
+      v.literal("video"),
+      v.literal("audio"),
+      v.literal("sfx"),
+      v.literal("score"),
+    )),
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {

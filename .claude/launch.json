@@ -12,9 +12,9 @@
         "--host",
         "127.0.0.1",
         "--port",
-        "8001"
+        "8002"
       ],
-      "port": 8001,
+      "port": 8002,
       "cwd": "dreamweaver-backend"
     },
     {
@@ -50,7 +50,8 @@
       "runtimeExecutable": "bunx",
       "runtimeArgs": [
         "convex",
-        "dev"
+        "dev",
+        "--once"
       ],
       "port": 0,
       "autoPort": true,

@@ -415,9 +415,24 @@ describe("Storyboard panels integration", () => {
     fireEvent.click(timelineView.getByText("Compute Diff"));
 
     fireEvent.click(dailiesView.getByText("Generate"));
+    // The refactored DailiesRow gates each button behind a per-row
+    // `busy` flag that flips while onUpdateStatus is pending. Rapid
+    // synchronous clicks used to all fire; now we must wait for each
+    // async handler to settle before the next click is accepted. Stepping
+    // through one status at a time mirrors how a producer actually
+    // interacts with the row.
     fireEvent.click(dailiesView.getByText("Approve"));
+    await waitFor(() => {
+      expect(dailiesStatusCalls.length).toBe(1);
+    });
     fireEvent.click(dailiesView.getByText("Mark Applied"));
+    await waitFor(() => {
+      expect(dailiesStatusCalls.length).toBe(2);
+    });
     fireEvent.click(dailiesView.getByText("Reject"));
+    await waitFor(() => {
+      expect(dailiesStatusCalls.length).toBe(3);
+    });
 
     fireEvent.click(continuityView.getByText("Detect"));
 

@@ -5,11 +5,16 @@ import { ChevronsUp } from "lucide-react";
 import type {
   NarrativeBranchRecord,
   NarrativeCommitRecord,
+  NarrativeMotifRecord,
+  NarrativeVariantRecord,
   SimulationCriticRunRecord,
+  StoryNode,
 } from "@/app/storyboard/types";
 import { CUT_TIER_LABELS, CUT_TIER_OPTIONS } from "@/app/storyboard/types";
 import { formatReviewRound, nextCutTier, type CutTier } from "@/lib/cut-tier";
 import { CherryPickDialog } from "./CherryPickDialog";
+import { VariantComparePanel } from "./VariantComparePanel";
+import { MotifMapPanel } from "./MotifMapPanel";
 
 type TimelineTheaterPanelProps = {
   simulationRuns: SimulationCriticRunRecord[];
@@ -23,6 +28,28 @@ type TimelineTheaterPanelProps = {
   onSetBranchCutTier?: (branchId: string, cutTier: CutTier) => Promise<void>;
   onSetCommitReviewRound?: (commitId: string, reviewRound?: number) => Promise<void>;
   onBumpBranchHeadReviewRound?: (branchId: string) => Promise<void>;
+  // M9 Phase 3 — variant compare sub-panel. Optional so storyboards
+  // without variants still render the Theater cleanly (Phase 1/2-only
+  // producers see no added chrome).
+  variants?: NarrativeVariantRecord[];
+  compareBranchIds?: string[];
+  onToggleCompareBranch?: (branchId: string) => void;
+  onPromoteVariant?: (variant: NarrativeVariantRecord) => Promise<void>;
+  // M9 Phase 4 — motif map sub-panel. Hidden when no motifs exist
+  // so storyboards that never invoked the motif_tracker see no
+  // added chrome.
+  motifs?: NarrativeMotifRecord[];
+  onFocusNode?: (nodeId: string) => void;
+  // M9 Phase 5 — manual motif plant. Optional: when supplied, the
+  // MotifMapPanel shows a "Plant motif" button + inline form.
+  shotNodes?: StoryNode[];
+  onPlantMotif?: (input: {
+    motifKey: string;
+    description: string;
+    targetNodeId: string;
+    role: "plant" | "payoff";
+    visualVocabulary?: string;
+  }) => Promise<void>;
 };
 
 const TONE_CLASSES: Record<
@@ -54,6 +81,14 @@ export function TimelineTheaterPanel({
   onComputeLatestDiff,
   onSetBranchCutTier,
   onBumpBranchHeadReviewRound,
+  variants,
+  compareBranchIds,
+  onToggleCompareBranch,
+  onPromoteVariant,
+  motifs,
+  onFocusNode,
+  shotNodes,
+  onPlantMotif,
 }: TimelineTheaterPanelProps) {
   const [cherryPickOpen, setCherryPickOpen] = useState(false);
   const rows = simulationRuns.slice(0, 6);
@@ -213,6 +248,35 @@ export function TimelineTheaterPanel({
         branches={branches}
         onCherryPick={onCherryPickCommit}
       />
+
+      {/* M9 Phase 3 — variant compare. Only renders when the parent
+       *  page supplies variants; M8-era consumers see no change. */}
+      {variants && onToggleCompareBranch && onPromoteVariant ? (
+        <div className="mt-4">
+          <VariantComparePanel
+            variants={variants}
+            branches={branches}
+            compareBranchIds={compareBranchIds ?? []}
+            onToggleCompareBranch={onToggleCompareBranch}
+            onPromoteVariant={onPromoteVariant}
+          />
+        </div>
+      ) : null}
+
+      {/* M9 Phase 4/5 — motif map. MotifMapPanel returns null
+       *  internally when both motifs is empty AND no plant form is
+       *  wired; otherwise it renders even for an empty list (the
+       *  form lets the producer seed the registry manually). */}
+      {motifs && (motifs.length > 0 || (shotNodes && onPlantMotif)) ? (
+        <div className="mt-4">
+          <MotifMapPanel
+            motifs={motifs}
+            onFocusNode={onFocusNode}
+            shotNodes={shotNodes}
+            onPlantMotif={onPlantMotif}
+          />
+        </div>
+      ) : null}
     </section>
   );
 }

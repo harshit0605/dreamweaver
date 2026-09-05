@@ -7,7 +7,18 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "bun test",
+    "_comment_test": "bun's mock.module is process-wide — running ALL test files in one `bun test` process leaks mocks across files (e.g. the bridge test registers a convex/react stub that later tests still see). We chunk by directory so each group runs in a fresh bun process with a clean mock registry. Individual files can still be run with `bun test <path>`.",
+    "test": "bun run test:chunked",
+    "test:raw": "bun test",
+    "test:chunked": "bun run test:chunked:lib && bun run test:chunked:components && bun run test:chunked:app",
+    "test:chunked:lib": "bun test src/lib",
+    "test:chunked:components": "bun test src/components",
+    "test:chunked:app": "bun test src/app",
+    "test:ci": "bun run test:chunked",
+    "_comment_e2e": "L6 Playwright suite. `test:e2e` runs against E2E_STAGING_URL with E2E_OPENAI_API_KEY + E2E_AUTH_SESSION_TOKEN (nightly cron + pre-release). `test:e2e:ui` opens the Playwright inspector for local debugging. `test:e2e:install` is a one-shot to download the chromium binary on first run.",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:install": "playwright install chromium",
     "convex:dev": "bunx convex dev",
     "convex:deploy": "bunx convex deploy",
     "auth:generate-schema": "bunx @better-auth/cli generate --config ./better-auth-config.ts --output ./convex/auth_config/schema.ts"
@@ -77,6 +88,7 @@
     "zod": "^4.3.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@tailwindcss/postcss": "^4",
     "@testing-library/react": "^16.3.2",
     "@types/bun": "^1.3.9",

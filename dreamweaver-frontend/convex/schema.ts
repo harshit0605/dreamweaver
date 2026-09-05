@@ -21,6 +21,12 @@ const mediaVariantValidator = v.object({
   url: v.string(),
   modelId: v.string(),
   createdAt: v.number(),
+  // M7 — loose per-variant metadata map. Currently used by SFX to
+  // carry `volumeDb` (stringified) so the reel export can read the
+  // producer's volume trim without a second Convex query per shot.
+  // Generic enough to add kind-specific bits later (e.g. per-video
+  // seed, per-image prompt hash) without another schema bump.
+  metadata: v.optional(v.record(v.string(), v.string())),
 });
 
 const approvalStatusValidator = v.union(
@@ -103,6 +109,18 @@ export default defineSchema({
         ),
       }),
     ),
+    // M8 — reel-level background score track. Points at a
+    // `mediaAssets` row with `kind: "score"`. Optional — a storyboard
+    // without a score exports fine (just no music layer). Separate
+    // from per-shot `activeSfxId`s because the score spans the whole
+    // reel and is picked / swapped at the storyboard scope.
+    activeScoreId: v.optional(v.id("mediaAssets")),
+    /** Score volume in dB, clamped to [-40, 0]. Stored as a number
+     *  here (unlike SFX which tucks it into variant metadata) because
+     *  there's exactly one active score per storyboard, so a dedicated
+     *  field is simpler than spelunking into a mediaAsset metadata
+     *  map on every reel export. */
+    scoreVolumeDb: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -212,11 +230,28 @@ export default defineSchema({
       // the same startMediaGeneration / completeMediaGeneration
       // mutations with `kind: "audio"`.
       audios: v.optional(v.array(mediaVariantValidator)),
+      // M7 — per-shot SFX (ambient / foley) track. Mixed UNDER the
+      // narration by the reel export pipeline. Kept separate from
+      // `audios` so swapping between generated SFX variants doesn't
+      // clobber the TTS take and vice-versa.
+      sfxs: v.optional(v.array(mediaVariantValidator)),
       activeImageId: v.optional(v.id("mediaAssets")),
       activeVideoId: v.optional(v.id("mediaAssets")),
       activeAudioId: v.optional(v.id("mediaAssets")),
+      activeSfxId: v.optional(v.id("mediaAssets")),
     }),
     status: v.union(v.literal("draft"), v.literal("ready"), v.literal("blocked")),
+    // M9 — narrative-refinement metadata. All optional; populated by
+    // the beat_analyst / tension_analyst / motif_tracker subagents or
+    // directly by producers via the beat ribbon / motif map UI.
+    // Free-form string fields (beatType, hookType) are validated at
+    // the route boundary so new structures can be added without a
+    // schema migration.
+    beatType: v.optional(v.string()),
+    actNumber: v.optional(v.number()),
+    tensionLevel: v.optional(v.number()),
+    motifIds: v.optional(v.array(v.string())),
+    hookType: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -244,6 +279,12 @@ export default defineSchema({
       }),
     ),
     isPrimary: v.boolean(),
+    // M9 — transition intent. Populated by transition_maestro proposals
+    // or directly on the canvas. Free-form so new cinematic transitions
+    // don't require a schema bump (route boundary validates against the
+    // known vocabulary: match_cut, j_cut, l_cut, time_jump,
+    // cross_cut_accelerate, hard_cut, dissolve, fade_to_black, ...).
+    transitionIntent: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -387,7 +428,20 @@ export default defineSchema({
     storyboardId: v.id("storyboards"),
     userId: v.string(),
     nodeId: v.string(),
-    kind: v.union(v.literal("image"), v.literal("video"), v.literal("audio")),
+    // M7 — "sfx" is the per-shot ambient/foley track mixed UNDER
+    // narration.
+    // M8 — "score" is the reel-level background music track mixed
+    // UNDER (narration + sfx). Distinct kind so reel-export can
+    // pick it up with its own amix pass, and so the schema stays
+    // honest about scope (`score` rows carry a dummy nodeId like
+    // `__storyboard__` since they aren't shot-scoped).
+    kind: v.union(
+      v.literal("image"),
+      v.literal("video"),
+      v.literal("audio"),
+      v.literal("sfx"),
+      v.literal("score"),
+    ),
     sourceUrl: v.string(),
     modelId: v.string(),
     prompt: v.string(),
@@ -643,6 +697,13 @@ export default defineSchema({
     // so producers can point at any OpenAI TTS voice without a schema
     // migration; validation happens at the route boundary.
     voice: v.optional(v.string()),
+    // M8 — optional ElevenLabs voice clone attached to this pack. When
+    // set, the audio batch routes this character's lines through
+    // ElevenLabs TTS using the clone's voice id, overriding the
+    // `voice` preset above for that character's solo-speaker shots.
+    // Multi-speaker mixes still honor it line-by-line via
+    // `SpeakerVoiceMap` / the clone lookup path.
+    voiceCloneId: v.optional(v.id("voiceClones")),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -957,6 +1018,104 @@ export default defineSchema({
   // storyboard-level reel doesn't need a synthetic node. Each row
   // carries enough metadata to re-play or re-download without
   // rebuilding the manifest.
+  // M7 — subtitle translation cache. Producers often re-fetch the
+  // same locale (switching between vtt/srt formats, reloading the
+  // player dialog, etc.); translating the same source cues over and
+  // over wastes OpenAI tokens without changing output. One row per
+  // (storyboardId, locale); `cuesHash` fingerprints the source texts
+  // so we can invalidate the row when the reel's dialogue changes.
+  subtitleTranslations: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    locale: v.string(),
+    /** Stable fingerprint of the source cue texts — when the reel's
+     *  dialogue changes this hash changes and the cache is bypassed. */
+    cuesHash: v.string(),
+    /** JSON-encoded `string[]` with one translated body per source
+     *  cue, in order. Paired with the source cue list's speaker
+     *  prefixes at read time. */
+    translatedTextsJson: v.string(),
+    /** Provider id for observability (e.g. `"gpt-4o-mini"`). Lets us
+     *  invalidate old rows after a provider swap if the quality
+     *  shifts. */
+    provider: v.string(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_locale", ["storyboardId", "locale"])
+    .index("by_user_updatedAt", ["userId", "updatedAt"]),
+
+  // M8 — producer-owned character voice clones. Keyed on the
+  // producer's userId (voice clones follow the producer account, not
+  // the storyboard, so the same clone can be reused across projects).
+  // Each row carries the ElevenLabs voice id, a short preview clip
+  // url, and optional usage metadata.
+  //
+  // Identity packs attach a clone via an optional `voiceCloneId`
+  // field on `identityPacks`; when the audio batch encounters a
+  // speaker whose pack has a clone attached, the TTS call is routed
+  // through ElevenLabs with that voice instead of the six OpenAI
+  // presets. Fallback to the OpenAI voice stays intact when the
+  // clone's provider errors (graceful degradation).
+  voiceClones: defineTable({
+    userId: v.string(),
+    /** Producer-facing display name, e.g. "Maya (warm, medium-pitch)". */
+    name: v.string(),
+    /** Optional description — tags, provenance ("sampled from XYZ
+     *  with consent"), character arc notes. */
+    description: v.optional(v.string()),
+    /** ElevenLabs voice id returned at clone time. This is the only
+     *  identifier the TTS runtime needs; everything else is metadata. */
+    elevenlabsVoiceId: v.string(),
+    /** URL of a short (≤30s) preview sample, stored in Convex
+     *  `_storage`. Surfaced in the picker so producers can audition
+     *  before assigning. Optional — older clones may not have one. */
+    previewUrl: v.optional(v.string()),
+    /** Optional locale the clone was trained in. Defaults to English
+     *  when absent. Useful when a producer clones a Spanish-speaking
+     *  actor and wants the voice clamped to that locale. */
+    locale: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_user_createdAt", ["userId", "createdAt"]),
+
+  // M8 — per-locale narration audio tracks. Each row attaches a
+  // `kind: "audio"` mediaAsset to a (nodeId, locale) pair so the reel
+  // pipeline can ship a dubbed reel per language without clobbering
+  // the source-language narration.
+  //
+  // Schema note: the source language (English) lives on the node's
+  // `media.audios` array as it always has; only translated locales
+  // land in this table. Keeps the common case (single-language reels)
+  // zero-overhead and makes the "which languages does this reel
+  // support?" query trivial: `list by storyboard + group by locale`.
+  localeNarrations: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    nodeId: v.string(),
+    /** BCP-47-ish locale code (e.g. "es", "fr-CA", "ja"). Producers
+     *  pick from the same 10-locale roster exposed in the subtitles
+     *  picker. */
+    locale: v.string(),
+    /** The `kind: "audio"` mediaAsset holding the dubbed narration
+     *  for this (node, locale) pair. Stored separately so a single
+     *  asset row serves variant history; the latest upsert wins. */
+    mediaAssetId: v.id("mediaAssets"),
+    /** Copy of the translated prompt used to generate this dub.
+     *  Kept here as an observability convenience — the reel
+     *  pipeline never reads it, but producers debugging a bad dub
+     *  want to see what the TTS was fed. */
+    translatedText: v.string(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_locale_node", [
+      "storyboardId",
+      "locale",
+      "nodeId",
+    ])
+    .index("by_storyboard_node", ["storyboardId", "nodeId"]),
+
   reelExports: defineTable({
     storyboardId: v.id("storyboards"),
     userId: v.string(),
@@ -972,4 +1131,123 @@ export default defineSchema({
   })
     .index("by_storyboard_createdAt", ["storyboardId", "createdAt"])
     .index("by_user_createdAt", ["userId", "createdAt"]),
+
+  // ============================================================
+  // M9 — Narrative refinement tables
+  // ============================================================
+  // Beat plan per (storyboard, branch). One row per active structure
+  // (a branch can only have one structure at a time; switching
+  // replaces the row). `beats` is an ordered list of slots; each slot
+  // carries `nodeId` when a storyboard node has been assigned to it.
+  // Status transitions: "planned" → "assigned" (node pinned) →
+  // "missing" (was assigned but producer deleted the node).
+  narrativeBeats: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    branchId: v.string(),
+    structure: v.union(
+      v.literal("save_the_cat"),
+      v.literal("harmon_circle"),
+      v.literal("three_act"),
+      v.literal("kishotenketsu"),
+      v.literal("hook_first"),
+    ),
+    beats: v.array(
+      v.object({
+        beatKey: v.string(),
+        expectedActNumber: v.optional(v.number()),
+        nodeId: v.optional(v.string()),
+        status: v.union(
+          v.literal("planned"),
+          v.literal("assigned"),
+          v.literal("missing"),
+        ),
+        rationale: v.optional(v.string()),
+      }),
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_branch", ["storyboardId", "branchId"])
+    .index("by_user_updatedAt", ["userId", "updatedAt"]),
+
+  // Motif registry. A motif is any recurring visual, prop, line, or
+  // sfx that spans multiple nodes. Setup nodes (source) plant the
+  // motif; payoff nodes land it. `landedStatus` summarizes whether
+  // every plant has a callback.
+  narrativeMotifs: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    motifKey: v.string(),
+    description: v.string(),
+    sourceNodeIds: v.array(v.string()),
+    payoffNodeIds: v.array(v.string()),
+    // Free-form description of the visual vocabulary (palette, prop,
+    // composition cue) so visual_director can echo it in the payoff
+    // shot's image prompt.
+    visualVocabulary: v.optional(v.string()),
+    landedStatus: v.union(
+      v.literal("unplanted"),
+      v.literal("planted"),
+      v.literal("landed"),
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_motifKey", ["storyboardId", "motifKey"])
+    .index("by_storyboard_updatedAt", ["storyboardId", "updatedAt"]),
+
+  // Links each narrative-git branch to its generator + rationale. Lets
+  // us build a variant catalog ("show me every cold-open variant this
+  // producer has tried") without walking every branch's commit log.
+  narrativeVariants: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    branchId: v.string(),
+    variantType: v.union(
+      v.literal("hook"),
+      v.literal("structural"),
+      v.literal("transition"),
+      v.literal("remix"),
+    ),
+    rationale: v.string(),
+    // The agent run that produced this variant — useful for tracing
+    // which chat turn spawned which branch.
+    generatedByRunId: v.optional(v.string()),
+    producerPicked: v.boolean(),
+    // When this variant was branched off another variant (not the
+    // primary timeline), record the parent so we can reconstruct a
+    // variant tree.
+    parentBranchId: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_type", ["storyboardId", "variantType"])
+    .index("by_storyboard_branch", ["storyboardId", "branchId"])
+    .index("by_user_updatedAt", ["userId", "updatedAt"]),
+
+  // Cached reel-level narrative state per (storyboard, branch). Acts
+  // as the Convex mirror of the LangGraph `reel_narrative_state`
+  // working memory. JSON payloads keep the ontology flexible — we
+  // intentionally don't pre-commit to a rigid beat schema since the
+  // structure changes per-branch (Save-the-Cat vs Harmon vs hook-first
+  // all have different beat vocabularies).
+  reelNarrativeState: defineTable({
+    storyboardId: v.id("storyboards"),
+    userId: v.string(),
+    branchId: v.string(),
+    structure: v.string(),
+    beatMapJson: v.string(),
+    motifRegistryJson: v.string(),
+    tensionSamplesJson: v.string(),
+    characterWantNeedJson: v.string(),
+    computedAt: v.number(),
+    // Commit id this state was computed from. Reconcile + invalidate
+    // when the branch head moves past this commit.
+    computedFromCommitId: v.optional(v.string()),
+    stale: v.boolean(),
+    updatedAt: v.number(),
+  })
+    .index("by_storyboard_branch", ["storyboardId", "branchId"])
+    .index("by_user_updatedAt", ["userId", "updatedAt"]),
 });

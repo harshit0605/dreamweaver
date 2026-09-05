@@ -667,6 +667,83 @@ export const updateEditorState = mutation({
   },
 });
 
+/**
+ * M8 — attach a reel-level background score to a storyboard. The
+ * `mediaAssetId` must point at a `kind: "score"` row; anything else
+ * gets rejected so we can't e.g. accidentally use a narration track
+ * as a music bed. Pass `null` to detach the current score.
+ */
+export const setStoryboardScore = mutation({
+  args: {
+    storyboardId: v.id("storyboards"),
+    mediaAssetId: v.union(v.id("mediaAssets"), v.null()),
+    volumeDb: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const userId = await requireUser(ctx);
+    await ensureStoryboardEditable(ctx, args.storyboardId, userId);
+    if (args.mediaAssetId !== null) {
+      const asset = await ctx.db.get(args.mediaAssetId);
+      if (!asset) {
+        throw new ConvexError("Score media asset not found");
+      }
+      if (asset.kind !== "score") {
+        throw new ConvexError(
+          `setStoryboardScore: asset kind is "${asset.kind}" (expected "score")`,
+        );
+      }
+      if (asset.storyboardId !== args.storyboardId) {
+        throw new ConvexError(
+          "Score media asset belongs to a different storyboard",
+        );
+      }
+    }
+    // Clamp the volume into the score dB window so a stray value can't
+    // produce an inaudible or clipping mix at export time.
+    const clampedVolume =
+      typeof args.volumeDb === "number"
+        ? Math.max(-40, Math.min(0, args.volumeDb))
+        : undefined;
+    await ctx.db.patch(args.storyboardId, {
+      activeScoreId: args.mediaAssetId ?? undefined,
+      scoreVolumeDb: clampedVolume,
+      updatedAt: Date.now(),
+    });
+    return { storyboardId: args.storyboardId, volumeDb: clampedVolume };
+  },
+});
+
+/** Read the active score + its metadata for a storyboard. Returns
+ *  `null` when no score is attached. Used by the reel export pipeline
+ *  and the Score panel UI. */
+export const getStoryboardScore = query({
+  args: { storyboardId: v.id("storyboards") },
+  handler: async (ctx, args) => {
+    const userId = await requireUser(ctx);
+    await ensureStoryboardEditable(ctx, args.storyboardId, userId);
+    const storyboard = await ctx.db.get(args.storyboardId);
+    if (!storyboard) return null;
+    const scoreId = storyboard.activeScoreId;
+    if (!scoreId) return null;
+    const asset = await ctx.db.get(scoreId);
+    if (!asset || asset.kind !== "score") return null;
+    return {
+      mediaAssetId: asset._id,
+      sourceUrl: asset.sourceUrl,
+      prompt: asset.prompt,
+      modelId: asset.modelId,
+      volumeDb:
+        typeof storyboard.scoreVolumeDb === "number"
+          ? storyboard.scoreVolumeDb
+          : null,
+      durationS:
+        typeof asset.metadata?.durationS === "string"
+          ? Number(asset.metadata.durationS)
+          : null,
+    };
+  },
+});
+
 export const trashStoryboard = mutation({
   args: {
     storyboardId: v.id("storyboards"),

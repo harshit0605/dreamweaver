@@ -30,6 +30,7 @@ import { mutationRef, queryRef } from "@/lib/convexRefs";
 import { createLogger, resolveRequestId } from "@/lib/observability";
 import type { NodeType, ShotMeta } from "@/app/storyboard/types";
 import {
+  buildBurnInSubtitlesArgs,
   buildConcatArgs,
   buildConcatListFile,
   buildShotNormalizeArgs,
@@ -38,6 +39,13 @@ import {
 } from "./helpers";
 import type { ReelManifest } from "@/app/api/storyboard/reel-manifest/route";
 import { buildReelManifest } from "@/app/api/storyboard/reel-manifest/route";
+import {
+  buildForceStyleString,
+  buildSubtitleCues,
+  renderSrt,
+  type SubtitleStyle,
+} from "@/lib/subtitles";
+import { buildSubtitleInputs } from "@/app/api/storyboard/subtitles/route";
 
 export const runtime = "nodejs";
 // ffmpeg-bound work can be long on a big reel. 15 min cap gives a
@@ -75,6 +83,16 @@ interface StoryboardSnapshot {
 
 interface ExportReelBody {
   storyboardId?: string;
+  /** M7 — when true, runs a second ffmpeg pass to burn captions
+   *  (from dialogue extraction) into the video stream. Default off:
+   *  most producers prefer a soft-subtitle `.vtt` / `.srt` they can
+   *  toggle; burn-in is for delivery channels that don't support
+   *  closed captions (e.g. Instagram Reels). */
+  burnInSubtitles?: boolean;
+  /** M7 — libass-style overrides applied when burnInSubtitles is on.
+   *  Ignored for soft-subtitle exports (the .vtt carries plain text
+   *  and the player styles it). */
+  subtitleStyle?: SubtitleStyle;
 }
 
 /** Return `true` iff `ffmpeg` is on PATH and runs `-version` cleanly. */
@@ -177,10 +195,11 @@ export async function POST(request: NextRequest): Promise<Response> {
     );
   }
 
+  const shots = snapshot.nodes.filter((n) => n.nodeType === "shot");
   const manifest: ReelManifest = buildReelManifest(
     storyboardId,
     snapshot.storyboard.title ?? "Untitled",
-    snapshot.nodes.filter((n) => n.nodeType === "shot"),
+    shots,
   );
   if (manifest.shots.length === 0) {
     return NextResponse.json(
@@ -214,6 +233,9 @@ export async function POST(request: NextRequest): Promise<Response> {
       const audioPath = plan.willDownloadAudio
         ? joinPath(workDir, `shot_${index}.src.mp3`)
         : null;
+      const sfxPath = plan.willDownloadSfx
+        ? joinPath(workDir, `shot_${index}.sfx.mp3`)
+        : null;
 
       if (videoPath && shot.videoUrl) {
         await fetchToFile(shot.videoUrl, videoPath);
@@ -224,18 +246,61 @@ export async function POST(request: NextRequest): Promise<Response> {
       if (audioPath && shot.audioUrl) {
         await fetchToFile(shot.audioUrl, audioPath);
       }
+      if (sfxPath && shot.sfxUrl) {
+        await fetchToFile(shot.sfxUrl, sfxPath);
+      }
 
-      // --- 2. Normalize into a uniform clip ----------------------
+      // --- 2a. Pre-mix narration + SFX into a single audio track --
+      // We pre-mix instead of extending buildShotNormalizeArgs because
+      // that helper already has four branches; adding a fifth with
+      // three audio sources would triple its complexity. Pre-mixing
+      // also keeps the normalize filter graph identical regardless of
+      // whether SFX is present — easier to reason about.
+      let effectiveAudioPath = audioPath;
+      if (sfxPath) {
+        const mixedPath = joinPath(workDir, `shot_${index}.amix.mp3`);
+        const mixEnd = log.startTimer("shot_sfx_premix", { index });
+        // Per-shot volume trim: producers set this via the slider in
+        // the SFX section of PropertiesPanel. `sfxVolumeDb === null`
+        // means no explicit trim yet → use the library default.
+        const { DEFAULT_SFX_VOLUME_DB, buildSfxMixArgs } = await import(
+          "@/lib/sfx"
+        );
+        const effectiveVolumeDb =
+          typeof shot.sfxVolumeDb === "number"
+            ? shot.sfxVolumeDb
+            : DEFAULT_SFX_VOLUME_DB;
+        if (audioPath) {
+          await runFfmpeg(
+            buildSfxMixArgs({
+              narrationPath: audioPath,
+              sfxPath,
+              outputPath: mixedPath,
+              volumeDb: effectiveVolumeDb,
+            }),
+          );
+          effectiveAudioPath = mixedPath;
+        } else {
+          // No narration — treat the SFX as the shot's only audio
+          // track. buildShotNormalizeArgs accepts it as audioPath; the
+          // downstream filter graph doesn't care about its origin.
+          effectiveAudioPath = sfxPath;
+        }
+        mixEnd({ volumeDb: effectiveVolumeDb });
+      }
+
+      // --- 2b. Normalize into a uniform clip ----------------------
       const outputPath = joinPath(workDir, `shot_${index}.mp4`);
       const normEnd = log.startTimer("shot_normalize", {
         index,
         kind: plan.kind,
         durationS: shot.durationS,
+        hasSfx: Boolean(sfxPath),
       });
       const { args } = buildShotNormalizeArgs({
         videoPath,
         imagePath,
-        audioPath,
+        audioPath: effectiveAudioPath,
         durationS: shot.durationS,
         outputPath,
       });
@@ -247,12 +312,98 @@ export async function POST(request: NextRequest): Promise<Response> {
     // --- 3. Concat all normalized clips --------------------------
     const concatListPath = joinPath(workDir, "concat.txt");
     await writeFile(concatListPath, buildConcatListFile(normalizedPaths));
-    const finalPath = joinPath(workDir, "reel.mp4");
+    const concatPath = joinPath(workDir, "reel.concat.mp4");
     const concatEnd = log.startTimer("concat_demuxer", {
       shotCount: normalizedPaths.length,
     });
-    await runFfmpeg(buildConcatArgs(concatListPath, finalPath));
+    await runFfmpeg(buildConcatArgs(concatListPath, concatPath));
     concatEnd({});
+
+    // --- 3a. Optional: burn in subtitles --------------------------
+    // Soft-subtitle path (default): `finalPath` = concat output,
+    // producers grab `.vtt` / `.srt` separately from the subtitles
+    // route. Burn-in path: render captions as baked pixels so the
+    // reel is playable on platforms that drop external caption
+    // tracks. We always generate the SRT — even when burn-in is on,
+    // cue generation is cheap and keeps the "open captions match the
+    // narration" contract visible.
+    let finalPath = concatPath;
+    const subtitleInputs = buildSubtitleInputs(shots);
+    const cues = buildSubtitleCues(subtitleInputs);
+    const burnInSubtitles = body.burnInSubtitles === true && cues.length > 0;
+    if (burnInSubtitles) {
+      const burnEnd = log.startTimer("burn_in_subtitles", {
+        cueCount: cues.length,
+      });
+      const srtPath = joinPath(workDir, "captions.srt");
+      await writeFile(srtPath, renderSrt(cues), "utf8");
+      const burnedPath = joinPath(workDir, "reel.mp4");
+      const forceStyle = body.subtitleStyle
+        ? buildForceStyleString(body.subtitleStyle)
+        : "";
+      // Host-local font directory. Operators drop .ttf / .otf files
+      // here at deploy time so `fontFamily: "Inter"` resolves
+      // consistently regardless of the base image's system fonts.
+      // Unset → libass uses host system fonts (fine for local dev).
+      const fontsDir = (process.env.SUBTITLE_FONTS_DIR ?? "").trim();
+      await runFfmpeg(
+        buildBurnInSubtitlesArgs({
+          videoPath: concatPath,
+          subtitlePath: srtPath,
+          outputPath: burnedPath,
+          forceStyle,
+          fontsDir: fontsDir.length > 0 ? fontsDir : undefined,
+        }),
+      );
+      finalPath = burnedPath;
+      burnEnd({});
+    }
+
+    // --- 3b. Optional: mix reel-level score track ------------------
+    // Runs AFTER burn-in so the score plays over the finalized
+    // picture. We download the score mp3 first (since the manifest
+    // only carries a URL), then feed both the reel + score to
+    // buildScoreMixArgs, which stream-copies video and re-encodes
+    // audio at the canonical 48kHz stereo AAC.
+    if (manifest.score) {
+      const scoreEnd = log.startTimer("score_mix", {
+        prompt: manifest.score.prompt?.slice(0, 80),
+      });
+      try {
+        const {
+          DEFAULT_SCORE_VOLUME_DB,
+          buildScoreMixArgs,
+        } = await import("@/lib/score");
+        const scorePath = joinPath(workDir, "score.mp3");
+        await fetchToFile(manifest.score.url, scorePath);
+        const mixedPath = joinPath(workDir, "reel.scored.mp4");
+        const volumeDb =
+          typeof manifest.score.volumeDb === "number"
+            ? manifest.score.volumeDb
+            : DEFAULT_SCORE_VOLUME_DB;
+        await runFfmpeg(
+          buildScoreMixArgs({
+            reelPath: finalPath,
+            scorePath,
+            outputPath: mixedPath,
+            volumeDb,
+          }),
+        );
+        finalPath = mixedPath;
+        scoreEnd({ volumeDb });
+      } catch (err) {
+        // Non-fatal — a failed score mix falls through to the already-
+        // concatenated reel so the producer at least gets narration +
+        // SFX. Log so the observability layer catches persistent
+        // provider / ffmpeg issues.
+        scoreEnd({
+          error: err instanceof Error ? err.message : String(err),
+        });
+        log.warn("score_mix_failed_fallback", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     // --- 4. Upload to Convex storage ------------------------------
     const uploadEnd = log.startTimer("upload_reel");

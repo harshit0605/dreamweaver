@@ -2,8 +2,16 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ImageIcon, Video, Music, Sparkles, Wand2, Settings2, Users, Volume2, X, Plus } from "lucide-react";
-import { useQuery } from "convex/react";
-import { queryRef } from "@/lib/convexRefs";
+import { useMutation, useQuery } from "convex/react";
+import { mutationRef, queryRef } from "@/lib/convexRefs";
+import {
+  DEFAULT_SFX_VOLUME_DB,
+  SFX_MAX_DURATION_S,
+  SFX_MAX_VOLUME_DB,
+  SFX_MIN_DURATION_S,
+  SFX_MIN_VOLUME_DB,
+  SFX_PROMPT_MAX_CHARS,
+} from "@/lib/sfx";
 import { MediaType } from "@/app/storyboard/types";
 import type {
   AspectRatio,
@@ -286,6 +294,26 @@ export default function PropertiesPanel({
               onSetAudioDesc={onSetNodeAudioDesc}
               disabled={isProcessing}
             />
+
+            {/* M7 — per-shot SFX (ambient / foley) track. Generates
+                via ElevenLabs Sound Effects; mixed under the narration
+                at export. Only rendered when we have a storyboardId
+                (required for the Convex mutation). */}
+            {storyboardId ? (
+              <SfxSection
+                storyboardId={storyboardId}
+                nodeId={id}
+                activeSfxUrl={(() => {
+                  const active = data.media.sfxs?.find(
+                    (s) => s.id === data.media.activeSfxId,
+                  );
+                  return active?.url ?? null;
+                })()}
+                activeSfxId={data.media.activeSfxId ?? null}
+                disabled={isProcessing}
+                shotDurationS={data.shotMeta?.durationS}
+              />
+            ) : null}
 
             <div className="rounded-xl border border-border/60 bg-card/40 p-3">
               <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
@@ -1257,6 +1285,411 @@ function CharactersInShotSection({
         )
       ) : null}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// M7 — per-shot SFX (ambient / foley) generator.
+// ---------------------------------------------------------------------------
+// Producers describe a sound (e.g. "soft rain on glass"), pick a
+// duration that mirrors the shot's own durationS by default, and set
+// the mix level in dB. Generation is a single round-trip to
+// /api/media/generate-sfx which returns an uploaded asset URL; the
+// `kind: "sfx"` mediaAsset mutation patches the node's activeSfxId
+// so the reel export pipeline picks it up automatically.
+// ---------------------------------------------------------------------------
+
+interface SfxSectionProps {
+  storyboardId: string;
+  nodeId: string;
+  /** URL of the currently-active SFX track (null when none assigned). */
+  activeSfxUrl: string | null;
+  /** Convex id of the currently-active SFX media asset. Needed for the
+   *  live-volume slider which patches metadata on the asset directly. */
+  activeSfxId: string | null;
+  /** Shot's declared duration — used as the default SFX duration so
+   *  the ambient track doesn't outrun the narration. */
+  shotDurationS?: number;
+  disabled?: boolean;
+}
+
+function SfxSection({
+  storyboardId,
+  nodeId,
+  activeSfxUrl,
+  activeSfxId,
+  shotDurationS,
+  disabled,
+}: SfxSectionProps) {
+  const [prompt, setPrompt] = useState("");
+  const [durationS, setDurationS] = useState<number>(() => {
+    // Default to the shot's declared duration when available, clamped
+    // into the SFX window. Never returns NaN.
+    const d = typeof shotDurationS === "number" ? shotDurationS : 5;
+    return Math.max(
+      SFX_MIN_DURATION_S,
+      Math.min(SFX_MAX_DURATION_S, Number.isFinite(d) ? d : 5),
+    );
+  });
+  const [volumeDb, setVolumeDb] = useState<number>(DEFAULT_SFX_VOLUME_DB);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const createMediaAsset = useMutation(
+    mutationRef("mediaAssets:createMediaAsset"),
+  );
+  const setSfxVolumeMutation = useMutation(
+    mutationRef("mediaAssets:setSfxVolume"),
+  );
+
+  // M7 — live-trim slider. Reads the current volume off the active
+  // SFX asset's metadata when it loads, and writes back on change so
+  // the reel export picks up the producer's choice. Skipped when no
+  // SFX is attached (the slider governs the NEXT generation's default
+  // in that case, controlled via local state only).
+  const activeSfxMetadata = useQuery(
+    queryRef("mediaAssets:getSfxAssetMetadata"),
+    activeSfxId ? { mediaAssetId: activeSfxId as never } : "skip",
+  ) as { volumeDb: number | null } | null | undefined;
+
+  // When the query resolves, sync the slider to the server value so
+  // two tabs / two clients agree. Only runs on active-sfx changes
+  // (not on every keystroke in the slider).
+  useEffect(() => {
+    if (
+      activeSfxId
+      && activeSfxMetadata
+      && typeof activeSfxMetadata.volumeDb === "number"
+    ) {
+      setVolumeDb(activeSfxMetadata.volumeDb);
+    }
+  }, [activeSfxId, activeSfxMetadata]);
+
+  const handleVolumeChange = useCallback(
+    async (next: number) => {
+      setVolumeDb(next);
+      if (!activeSfxId) return;
+      try {
+        await setSfxVolumeMutation({
+          mediaAssetId: activeSfxId as never,
+          volumeDb: next,
+        });
+      } catch (err) {
+        // Surface the error inline; the slider value is already set
+        // locally so the producer can retry by nudging the slider.
+        setError(
+          err instanceof Error ? err.message : "Failed to save volume.",
+        );
+      }
+    },
+    [activeSfxId, setSfxVolumeMutation],
+  );
+
+  const handleGenerate = async () => {
+    if (!prompt.trim()) {
+      setError("Describe the sound effect first.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/media/generate-sfx", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+          durationS,
+          volumeDb,
+          storyboardId,
+        }),
+      });
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        throw new Error(
+          payload.error ?? `SFX generation failed (${res.status})`,
+        );
+      }
+      const data = (await res.json()) as {
+        url: string;
+        provider: string;
+      };
+      // Persist as a mediaAsset with kind="sfx"; createMediaAsset
+      // updates the node's activeSfxId automatically.
+      await createMediaAsset({
+        storyboardId: storyboardId as never,
+        nodeId,
+        kind: "sfx",
+        sourceUrl: data.url,
+        modelId: data.provider,
+        prompt: prompt.trim(),
+        status: "completed",
+        metadata: {
+          durationS: String(durationS),
+          volumeDb: String(volumeDb),
+        },
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-border/60 bg-card/40 p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+          <Music className="size-3.5" />
+          Sound effects
+        </div>
+        <span
+          className={cn(
+            "rounded-full border px-2 py-0.5 text-[10px]",
+            activeSfxUrl
+              ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+              : "border-border/60 bg-background/60 text-muted-foreground",
+          )}
+        >
+          {activeSfxUrl ? "attached" : "none"}
+        </span>
+      </div>
+      <div className="mt-2 text-[11px] text-muted-foreground">
+        Ambient/foley layer mixed UNDER the narration during export.
+      </div>
+      <Textarea
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value.slice(0, SFX_PROMPT_MAX_CHARS))}
+        placeholder={"e.g. \"soft rain on glass, distant thunder\""}
+        disabled={disabled || busy}
+        className="mt-2 min-h-[56px] bg-background/60 text-[12px]"
+        maxLength={SFX_PROMPT_MAX_CHARS}
+      />
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+        <label className="flex items-center gap-1 text-muted-foreground">
+          Duration
+          <input
+            type="number"
+            min={SFX_MIN_DURATION_S}
+            max={SFX_MAX_DURATION_S}
+            step={1}
+            value={durationS}
+            onChange={(e) =>
+              setDurationS(
+                Math.max(
+                  SFX_MIN_DURATION_S,
+                  Math.min(
+                    SFX_MAX_DURATION_S,
+                    Number(e.target.value) || SFX_MIN_DURATION_S,
+                  ),
+                ),
+              )
+            }
+            disabled={disabled || busy}
+            className="h-6 w-14 rounded border border-border/60 bg-background/60 px-1.5 text-[11px]"
+          />
+          s
+        </label>
+        <label
+          className="flex items-center gap-1 text-muted-foreground"
+          title={
+            activeSfxId
+              ? "Volume trim — saves to the active SFX asset so the reel export uses this level."
+              : "Volume the next-generated SFX will be mixed at."
+          }
+        >
+          Volume
+          <input
+            type="range"
+            min={SFX_MIN_VOLUME_DB}
+            max={SFX_MAX_VOLUME_DB}
+            step={1}
+            value={volumeDb}
+            onChange={(e) => {
+              const next = Math.max(
+                SFX_MIN_VOLUME_DB,
+                Math.min(
+                  SFX_MAX_VOLUME_DB,
+                  Number(e.target.value) || DEFAULT_SFX_VOLUME_DB,
+                ),
+              );
+              void handleVolumeChange(next);
+            }}
+            disabled={disabled || busy}
+            className="h-4 w-24 accent-emerald-500"
+          />
+          <span className="w-10 tabular-nums text-right">{volumeDb} dB</span>
+        </label>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => void handleGenerate()}
+          disabled={disabled || busy || prompt.trim().length === 0}
+          className="gap-1.5"
+        >
+          {busy ? (
+            <>
+              <span className="size-3 animate-spin rounded-full border-2 border-current/30 border-t-current" />
+              Generating…
+            </>
+          ) : (
+            <>
+              <Wand2 className="size-3.5" />
+              {activeSfxUrl ? "Regenerate" : "Generate"}
+            </>
+          )}
+        </Button>
+      </div>
+      {activeSfxUrl ? (
+        <audio
+          src={activeSfxUrl}
+          controls
+          preload="none"
+          className="mt-2 w-full"
+        />
+      ) : null}
+      {/* M7 — previous takes. Producers often iterate the prompt a
+          few times before landing on one they like; keeping every
+          variant listed lets them swap back without regenerating. */}
+      <SfxVariantsList
+        storyboardId={storyboardId}
+        nodeId={nodeId}
+        activeSfxId={activeSfxId}
+        disabled={disabled || busy}
+      />
+      {error ? (
+        <p className="mt-2 text-[10px] text-rose-400" title={error}>
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// M7 — historical SFX takes picker.
+// ---------------------------------------------------------------------------
+// Shows every completed SFX mediaAsset for a node; clicking a row
+// flips the node's `activeSfxId` via `setActiveMediaVariant`. Producers
+// can audition past takes via the inline audio scrubber before
+// committing.
+// ---------------------------------------------------------------------------
+
+interface SfxVariantsListProps {
+  storyboardId: string;
+  nodeId: string;
+  activeSfxId: string | null;
+  disabled?: boolean;
+}
+
+function SfxVariantsList({
+  storyboardId,
+  nodeId,
+  activeSfxId,
+  disabled,
+}: SfxVariantsListProps) {
+  const variants = useQuery(queryRef("mediaAssets:listNodeMedia"), {
+    storyboardId: storyboardId as never,
+    nodeId,
+    kind: "sfx",
+    limit: 20,
+  }) as
+    | Array<{
+        _id: string;
+        sourceUrl: string;
+        prompt: string;
+        status: "pending" | "completed" | "failed" | "rolled_back";
+        createdAt: number;
+      }>
+    | undefined;
+
+  const setActiveMediaVariant = useMutation(
+    mutationRef("mediaAssets:setActiveMediaVariant"),
+  );
+  const [switching, setSwitching] = useState<string | null>(null);
+
+  const completed = useMemo(
+    () => (variants ?? []).filter((v) => v.status === "completed"),
+    [variants],
+  );
+
+  if (completed.length <= 1) {
+    // Hide the picker entirely when there's nothing to pick between —
+    // the single-active case is already handled by the <audio>
+    // element above.
+    return null;
+  }
+
+  const handleActivate = async (mediaAssetId: string) => {
+    if (disabled || switching || mediaAssetId === activeSfxId) return;
+    setSwitching(mediaAssetId);
+    try {
+      await setActiveMediaVariant({
+        storyboardId: storyboardId as never,
+        nodeId,
+        mediaAssetId: mediaAssetId as never,
+      });
+    } finally {
+      setSwitching(null);
+    }
+  };
+
+  return (
+    <details className="mt-2 rounded border border-border/40 bg-background/30 p-2 text-[11px]">
+      <summary className="cursor-pointer text-muted-foreground">
+        Previous takes ({completed.length})
+      </summary>
+      <ul className="mt-2 space-y-1.5">
+        {completed.map((variant) => {
+          const isActive = variant._id === activeSfxId;
+          const isSwitching = switching === variant._id;
+          return (
+            <li
+              key={variant._id}
+              className={cn(
+                "flex items-center gap-2 rounded border px-1.5 py-1",
+                isActive
+                  ? "border-emerald-500/40 bg-emerald-500/5"
+                  : "border-border/40 bg-background/40",
+              )}
+            >
+              <button
+                type="button"
+                onClick={() => void handleActivate(variant._id)}
+                disabled={disabled || isActive || isSwitching}
+                className={cn(
+                  "shrink-0 rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide",
+                  isActive
+                    ? "bg-emerald-500/20 text-emerald-200"
+                    : "border border-border/60 bg-background/60 hover:bg-background/80 disabled:opacity-40",
+                )}
+                title={
+                  isActive
+                    ? "This take is already active."
+                    : "Make this take the active SFX for the shot."
+                }
+              >
+                {isActive ? "active" : isSwitching ? "…" : "use"}
+              </button>
+              <span
+                className="min-w-0 flex-1 truncate text-muted-foreground"
+                title={variant.prompt}
+              >
+                {variant.prompt || "(no prompt)"}
+              </span>
+              <audio
+                src={variant.sourceUrl}
+                controls
+                preload="none"
+                className="h-6 max-w-[140px]"
+              />
+            </li>
+          );
+        })}
+      </ul>
+    </details>
   );
 }
 

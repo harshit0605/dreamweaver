@@ -19,10 +19,14 @@ from deep.tools import (
     filter_tools_by_allowlist,
     is_tool_allowed,
     recommend_ingestion_path,
+    request_assign_voice_cast,
     request_export_reel,
     request_generate_shot_batch,
     request_generate_shot_video_batch,
     request_generate_shot_audio_batch,
+    request_generate_shot_sfx_batch,
+    request_generate_score,
+    request_dailies_critic_review,
     request_ingestion_run,
 )
 
@@ -309,6 +313,166 @@ class RequestGenerateShotAudioBatchTests(unittest.TestCase):
         self.assertEqual(payload["input"]["concurrency"], 5)
 
 
+class RequestGenerateShotSfxBatchTests(unittest.TestCase):
+    def test_shape_is_waiting_for_human(self) -> None:
+        payload = request_generate_shot_sfx_batch.invoke(
+            {
+                "storyboard_id": "sb_42",
+                "branch_id": "br_main",
+                "node_count": 8,
+                "rationale": "Give every shot an ambient bed.",
+            }
+        )
+        self.assertEqual(payload["status"], "waiting_for_human")
+        self.assertEqual(payload["action"], "request_generate_shot_sfx_batch")
+        # Defaults surface: skip_existing True, concurrency 3.
+        self.assertTrue(payload["input"]["skipExisting"])
+        self.assertEqual(payload["input"]["concurrency"], 3)
+
+    def test_concurrency_caps_at_five(self) -> None:
+        payload = request_generate_shot_sfx_batch.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "branch_id": "br_main",
+                "node_count": 1,
+                "rationale": "",
+                "concurrency": 99,
+            }
+        )
+        self.assertEqual(payload["input"]["concurrency"], 5)
+
+    def test_concurrency_floors_at_one(self) -> None:
+        payload = request_generate_shot_sfx_batch.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "branch_id": "br_main",
+                "node_count": 1,
+                "rationale": "",
+                "concurrency": 0,
+            }
+        )
+        self.assertEqual(payload["input"]["concurrency"], 1)
+
+    def test_node_count_clamped_to_non_negative(self) -> None:
+        payload = request_generate_shot_sfx_batch.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "branch_id": "br_main",
+                "node_count": -5,
+                "rationale": "",
+            }
+        )
+        self.assertEqual(payload["input"]["nodeCount"], 0)
+
+    def test_rationale_trimmed_and_capped(self) -> None:
+        payload = request_generate_shot_sfx_batch.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "branch_id": "br_main",
+                "node_count": 1,
+                "rationale": "   multi\n\n  whitespace   content   " + "x" * 2000,
+            }
+        )
+        rationale = payload["input"]["rationale"]
+        # No runs of whitespace > 1; total length capped at 1200.
+        self.assertNotIn("  ", rationale)
+        self.assertLessEqual(len(rationale), 1200)
+
+
+class RequestGenerateScoreTests(unittest.TestCase):
+    def test_shape_is_waiting_for_human(self) -> None:
+        payload = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_42",
+                "prompt": "somber piano underscore, 80 BPM",
+                "rationale": "Producer asked for a music bed.",
+            }
+        )
+        self.assertEqual(payload["status"], "waiting_for_human")
+        self.assertEqual(payload["action"], "request_generate_score")
+        # Defaults surface.
+        self.assertEqual(payload["input"]["durationS"], 60)
+        self.assertEqual(payload["input"]["volumeDb"], -18)
+
+    def test_duration_clamped_into_window(self) -> None:
+        too_long = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "prompt": "x",
+                "rationale": "",
+                "duration_s": 9999,
+            }
+        )
+        too_short = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "prompt": "x",
+                "rationale": "",
+                "duration_s": 1,
+            }
+        )
+        self.assertEqual(too_long["input"]["durationS"], 300)
+        self.assertEqual(too_short["input"]["durationS"], 10)
+
+    def test_volume_clamped_to_dB_window(self) -> None:
+        loud = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "prompt": "x",
+                "rationale": "",
+                "volume_db": 10,
+            }
+        )
+        quiet = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "prompt": "x",
+                "rationale": "",
+                "volume_db": -500,
+            }
+        )
+        self.assertEqual(loud["input"]["volumeDb"], 0)
+        self.assertEqual(quiet["input"]["volumeDb"], -40)
+
+    def test_prompt_trimmed_and_capped(self) -> None:
+        payload = request_generate_score.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "prompt": "   multi\n\nwhitespace  prompt   " + "x" * 1000,
+                "rationale": "",
+            }
+        )
+        prompt = payload["input"]["prompt"]
+        self.assertNotIn("  ", prompt)
+        self.assertLessEqual(len(prompt), 600)
+
+
+class RequestDailiesCriticReviewTests(unittest.TestCase):
+    def test_shape_is_waiting_for_human(self) -> None:
+        payload = request_dailies_critic_review.invoke(
+            {
+                "storyboard_id": "sb_42",
+                "dailies_reel_id": "reel_abc",
+                "rationale": "Before applying, run critic sweep.",
+            }
+        )
+        self.assertEqual(payload["status"], "waiting_for_human")
+        self.assertEqual(
+            payload["action"], "request_dailies_critic_review"
+        )
+        self.assertEqual(payload["input"]["dailiesReelId"], "reel_abc")
+
+    def test_rationale_whitespace_normalized(self) -> None:
+        payload = request_dailies_critic_review.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "dailies_reel_id": "reel_1",
+                "rationale": "one\ttwo\n\nthree",
+            }
+        )
+        self.assertEqual(payload["input"]["rationale"], "one two three")
+
+
 class RequestExportReelTests(unittest.TestCase):
     def test_shape_is_waiting_for_human(self) -> None:
         payload = request_export_reel.invoke(
@@ -349,6 +513,67 @@ class RequestExportReelTests(unittest.TestCase):
         self.assertLessEqual(len(payload["input"]["rationale"]), 1200)
 
 
+class RequestAssignVoiceCastTests(unittest.TestCase):
+    def test_shape_is_waiting_for_human(self) -> None:
+        payload = request_assign_voice_cast.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "assignments": [
+                    {"packId": "pack_maya", "voice": "nova"},
+                    {"packId": "pack_daniel", "voice": "onyx"},
+                ],
+                "rationale": "MAYA reads determined; DANIEL reads controlled.",
+            }
+        )
+        self.assertEqual(payload["action"], "request_assign_voice_cast")
+        self.assertEqual(payload["status"], "waiting_for_human")
+        self.assertEqual(len(payload["input"]["assignments"]), 2)
+        self.assertEqual(payload["input"]["assignments"][0]["voice"], "nova")
+
+    def test_drops_entries_missing_pack_id(self) -> None:
+        payload = request_assign_voice_cast.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "assignments": [
+                    {"packId": "pack_a", "voice": "nova"},
+                    {"packId": "", "voice": "onyx"},
+                    {"voice": "shimmer"},
+                ],
+                "rationale": "",
+            }
+        )
+        self.assertEqual(len(payload["input"]["assignments"]), 1)
+        self.assertEqual(
+            payload["input"]["assignments"][0]["packId"], "pack_a"
+        )
+
+    def test_normalizes_voice_to_lowercase(self) -> None:
+        payload = request_assign_voice_cast.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "assignments": [{"packId": "pack_a", "voice": "  SHIMMER  "}],
+                "rationale": "",
+            }
+        )
+        self.assertEqual(
+            payload["input"]["assignments"][0]["voice"], "shimmer"
+        )
+
+    def test_empty_voice_is_preserved_as_clear_signal(self) -> None:
+        payload = request_assign_voice_cast.invoke(
+            {
+                "storyboard_id": "sb_1",
+                "assignments": [{"packId": "pack_a", "voice": ""}],
+                "rationale": "Clear the mapping.",
+            }
+        )
+        # Empty string is intentional — the bridge uses it to clear
+        # the mapping via `setIdentityPackVoice("")`.
+        self.assertEqual(
+            payload["input"]["assignments"][0]["voice"], ""
+        )
+
+
 class PolicyAndRegistryTests(unittest.TestCase):
     def test_policy_tokens_registered(self) -> None:
         self.assertEqual(
@@ -369,8 +594,24 @@ class PolicyAndRegistryTests(unittest.TestCase):
             "shot_audio_batch.run",
         )
         self.assertEqual(
+            TOOL_POLICY_TOKENS[request_generate_shot_sfx_batch.name],
+            "shot_sfx_batch.run",
+        )
+        self.assertEqual(
+            TOOL_POLICY_TOKENS[request_generate_score.name],
+            "reel_score.run",
+        )
+        self.assertEqual(
+            TOOL_POLICY_TOKENS[request_dailies_critic_review.name],
+            "dailies.critic_review",
+        )
+        self.assertEqual(
             TOOL_POLICY_TOKENS[request_export_reel.name],
             "reel_export.run",
+        )
+        self.assertEqual(
+            TOOL_POLICY_TOKENS[request_assign_voice_cast.name],
+            "voice_cast.assign",
         )
 
     def test_default_allowlist_includes_new_tokens(self) -> None:
@@ -378,7 +619,11 @@ class PolicyAndRegistryTests(unittest.TestCase):
         self.assertIn("shot_batch.run", DEFAULT_RUNTIME_ALLOWLIST)
         self.assertIn("shot_video_batch.run", DEFAULT_RUNTIME_ALLOWLIST)
         self.assertIn("shot_audio_batch.run", DEFAULT_RUNTIME_ALLOWLIST)
+        self.assertIn("shot_sfx_batch.run", DEFAULT_RUNTIME_ALLOWLIST)
+        self.assertIn("reel_score.run", DEFAULT_RUNTIME_ALLOWLIST)
+        self.assertIn("dailies.critic_review", DEFAULT_RUNTIME_ALLOWLIST)
         self.assertIn("reel_export.run", DEFAULT_RUNTIME_ALLOWLIST)
+        self.assertIn("voice_cast.assign", DEFAULT_RUNTIME_ALLOWLIST)
 
     def test_is_tool_allowed_under_default_policy(self) -> None:
         # Passing empty allowlist should trigger default policy.
@@ -386,7 +631,11 @@ class PolicyAndRegistryTests(unittest.TestCase):
         self.assertTrue(is_tool_allowed([], "shot_batch.run"))
         self.assertTrue(is_tool_allowed([], "shot_video_batch.run"))
         self.assertTrue(is_tool_allowed([], "shot_audio_batch.run"))
+        self.assertTrue(is_tool_allowed([], "shot_sfx_batch.run"))
+        self.assertTrue(is_tool_allowed([], "reel_score.run"))
+        self.assertTrue(is_tool_allowed([], "dailies.critic_review"))
         self.assertTrue(is_tool_allowed([], "reel_export.run"))
+        self.assertTrue(is_tool_allowed([], "voice_cast.assign"))
         # But team.manage is still gated behind explicit opt-in.
         self.assertFalse(is_tool_allowed([], "team.manage"))
 
@@ -397,7 +646,11 @@ class PolicyAndRegistryTests(unittest.TestCase):
         self.assertIn(request_generate_shot_batch.name, supervisor_names)
         self.assertIn(request_generate_shot_video_batch.name, supervisor_names)
         self.assertIn(request_generate_shot_audio_batch.name, supervisor_names)
+        self.assertIn(request_generate_shot_sfx_batch.name, supervisor_names)
+        self.assertIn(request_generate_score.name, supervisor_names)
+        self.assertIn(request_dailies_critic_review.name, supervisor_names)
         self.assertIn(request_export_reel.name, supervisor_names)
+        self.assertIn(request_assign_voice_cast.name, supervisor_names)
 
     def test_new_tools_present_in_all_tools(self) -> None:
         all_names = {getattr(t, "name", "") for t in ALL_TOOLS}
@@ -406,7 +659,11 @@ class PolicyAndRegistryTests(unittest.TestCase):
         self.assertIn(request_generate_shot_batch.name, all_names)
         self.assertIn(request_generate_shot_video_batch.name, all_names)
         self.assertIn(request_generate_shot_audio_batch.name, all_names)
+        self.assertIn(request_generate_shot_sfx_batch.name, all_names)
+        self.assertIn(request_generate_score.name, all_names)
+        self.assertIn(request_dailies_critic_review.name, all_names)
         self.assertIn(request_export_reel.name, all_names)
+        self.assertIn(request_assign_voice_cast.name, all_names)
 
     def test_video_batch_policy_gate_independent_of_image_batch(self) -> None:
         # A strict allowlist that only enables image batch must not leak

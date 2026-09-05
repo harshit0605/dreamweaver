@@ -29,6 +29,8 @@ import { ExportMenu } from "@/components/storyboard/ExportMenu";
 import { GenerateAllShotsButton } from "@/components/storyboard/GenerateAllShotsButton";
 import { GenerateAllVideosButton } from "@/components/storyboard/GenerateAllVideosButton";
 import { GenerateAllAudiosButton } from "@/components/storyboard/GenerateAllAudiosButton";
+import { GenerateAllSfxsButton } from "@/components/storyboard/GenerateAllSfxsButton";
+import { NarrativeBar } from "@/components/storyboard/NarrativeBar";
 import { RegenerateFlaggedButton } from "@/components/storyboard/RegenerateFlaggedButton";
 import { ReelPlayer } from "@/components/storyboard/ReelPlayer";
 import { CameoUploadDialog } from "@/components/storyboard/CameoUploadDialog";
@@ -71,6 +73,8 @@ import {
   ConstraintBundle,
   NarrativeBranchRecord,
   NarrativeCommitRecord,
+  NarrativeMotifRecord,
+  NarrativeVariantRecord,
 } from "@/app/storyboard/types";
 import type { CutTier } from "@/lib/cut-tier";
 import { generateStoryGraph, editNodeText, generateMedia } from "@/app/storyboard/services/apiService";
@@ -96,11 +100,26 @@ type SnapshotNode = {
   };
   promptPack?: StoryNodeData["promptPack"];
   shotMeta?: ShotMeta;
+  // M9 — narrative refinement fields flow from `getStoryboardSnapshot`
+  // into the client-side StoryNodeData so NarrativeBar + BeatRibbon
+  // can render without a second Convex query.
+  beatType?: string;
+  actNumber?: number;
+  tensionLevel?: number;
+  motifIds?: string[];
+  hookType?: string;
   media?: {
     images: Array<{ mediaAssetId: string; url: string; modelId: string; createdAt: number }>;
     videos: Array<{ mediaAssetId: string; url: string; modelId: string; createdAt: number }>;
+    // M7 — narration TTS and SFX (ambient/foley) tracks. Optional
+    // because existing snapshots don't carry them; getStoryboardSnapshot
+    // returns them when present.
+    audios?: Array<{ mediaAssetId: string; url: string; modelId: string; createdAt: number }>;
+    sfxs?: Array<{ mediaAssetId: string; url: string; modelId: string; createdAt: number }>;
     activeImageId?: string;
     activeVideoId?: string;
+    activeAudioId?: string;
+    activeSfxId?: string;
   };
 };
 
@@ -176,11 +195,33 @@ const mapNodeMedia = (
     status: "completed",
     createdAt: row.createdAt,
   }));
+  const audios: MediaVariant[] = (nodeMedia.audios ?? []).map((row) => ({
+    id: row.mediaAssetId,
+    kind: "audio",
+    url: row.url,
+    modelId: row.modelId,
+    prompt: "",
+    status: "completed",
+    createdAt: row.createdAt,
+  }));
+  const sfxs: MediaVariant[] = (nodeMedia.sfxs ?? []).map((row) => ({
+    id: row.mediaAssetId,
+    kind: "sfx",
+    url: row.url,
+    modelId: row.modelId,
+    prompt: "",
+    status: "completed",
+    createdAt: row.createdAt,
+  }));
   return {
     images,
     videos,
+    audios,
+    sfxs,
     activeImageId: nodeMedia.activeImageId,
     activeVideoId: nodeMedia.activeVideoId,
+    activeAudioId: nodeMedia.activeAudioId,
+    activeSfxId: nodeMedia.activeSfxId,
   };
 };
 
@@ -425,6 +466,29 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
       : "skip",
   ) as NarrativeCommitRecord[] | undefined;
 
+  // M9 Phase 3 — variant catalog for Variant Compare.
+  const narrativeVariants = useQuery(
+    queryRef("narrativeState:listVariants"),
+    activeStoryboardId ? { storyboardId: activeStoryboardId } : "skip",
+  ) as NarrativeVariantRecord[] | undefined;
+  // M9 Phase 4 — motif registry for MotifMapPanel.
+  const narrativeMotifs = useQuery(
+    queryRef("narrativeState:listMotifs"),
+    activeStoryboardId ? { storyboardId: activeStoryboardId } : "skip",
+  ) as NarrativeMotifRecord[] | undefined;
+  const [compareBranchIds, setCompareBranchIds] = useState<string[]>([]);
+  const toggleCompareBranch = useCallback((branchId: string) => {
+    setCompareBranchIds((prev) => {
+      if (prev.includes(branchId)) {
+        return prev.filter((b) => b !== branchId);
+      }
+      // Cap the compare pair at 2. Adding a third slot evicts the
+      // oldest so the pair feels FIFO to the producer.
+      const next = [...prev, branchId];
+      return next.length > 2 ? next.slice(next.length - 2) : next;
+    });
+  }, []);
+
   const upsertNode = useMutation(mutationRef("storyboards:upsertNode"));
   const deleteNode = useMutation(mutationRef("storyboards:deleteNode"));
   const upsertEdge = useMutation(mutationRef("storyboards:upsertEdge"));
@@ -481,6 +545,26 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
   const removeIdentityReferenceMutation = useMutation(mutationRef("identityReferences:removeIdentityReference"));
   const createBranchMutation = useMutation(mutationRef("narrativeGit:createBranch"));
   const cherryPickCommitMutation = useMutation(mutationRef("narrativeGit:cherryPickCommit"));
+  // M9 Phase 3 — variant compare: listVariants for the panel, merge
+  // policy + markVariantPicked for the "Pick" action.
+  const applyMergePolicyFromPageMutation = useMutation(
+    mutationRef("narrativeGit:applyMergePolicy"),
+  );
+  const markVariantPickedMutation = useMutation(
+    mutationRef("narrativeState:markVariantPicked"),
+  );
+  // M9 Phase 5 — manual motif quick-plant. upsertMotif is append-
+  // merge at the Convex layer (existing sources/payoffs preserved),
+  // but we resolve the current row client-side first so we can
+  // upsert with the MERGED arrays. Without that, the mutation would
+  // overwrite the arrays with the single new entry and lose prior
+  // plants/payoffs that came from other manual plants + the agent.
+  const upsertMotifFromPageMutation = useMutation(
+    mutationRef("narrativeState:upsertMotif"),
+  );
+  const setNodeNarrativeFieldsFromPageMutation = useMutation(
+    mutationRef("narrativeState:setNodeNarrativeFields"),
+  );
   const setBranchCutTierMutation = useMutation(mutationRef("narrativeGit:setBranchCutTier"));
   const setCommitReviewRoundMutation = useMutation(mutationRef("narrativeGit:setCommitReviewRound"));
   const bumpBranchHeadReviewRoundMutation = useMutation(mutationRef("narrativeGit:bumpBranchHeadReviewRound"));
@@ -565,6 +649,12 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
           },
           promptPack: node.promptPack ?? { continuityDirectives: [] },
           shotMeta: node.shotMeta,
+          // M9 narrative fields — flow straight through the snapshot.
+          beatType: node.beatType,
+          actNumber: node.actNumber,
+          tensionLevel: node.tensionLevel,
+          motifIds: node.motifIds,
+          hookType: node.hookType,
           media,
           image: activeImage,
           video: activeVideo,
@@ -1658,6 +1748,24 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
 
   const handleRunShotValidators = useCallback(async () => {
     if (!activeStoryboardId) return;
+    // Extract the loose subset voice-coverage needs — `identityPacks` on
+    // the constraint bundle is typed as Array<Record<string, unknown>> so
+    // we coerce the string fields and drop anything else.
+    const identityPacksForValidator = (
+      continuityBundle?.identityPacks ?? []
+    ).map((pack) => ({
+      name:
+        typeof pack.name === "string" ? pack.name : undefined,
+      sourceCharacterId:
+        typeof pack.sourceCharacterId === "string"
+          ? pack.sourceCharacterId
+          : undefined,
+      voice: typeof pack.voice === "string" ? pack.voice : undefined,
+      // M6 polish — dnaJson fuels the voice-gender mismatch critic.
+      // ValidatorIdentityPack type doesn't list it but the validator
+      // reads it opportunistically; legacy validators ignore it.
+      dnaJson: typeof pack.dnaJson === "string" ? pack.dnaJson : undefined,
+    }));
     const input = {
       nodes: nodes.map((n) => ({
         nodeId: n.id,
@@ -1665,6 +1773,9 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
         label: n.data.label,
         shotMeta: n.data.shotMeta,
         entityRefs: n.data.entityRefs,
+        // M6 Voice #5 — segment text enables the voice-coverage
+        // validator to detect speakers without a mapped TTS voice.
+        segment: n.data.segment,
       })),
       edges: edges.map((e) => ({
         sourceNodeId: e.source,
@@ -1673,6 +1784,7 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
         isPrimary: e.data?.isPrimary,
         order: e.data?.order,
       })),
+      identityPacks: identityPacksForValidator,
     };
     const violations = runShotValidators(input);
     await recordShotValidatorViolationsMutation({
@@ -1681,7 +1793,13 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
       violations,
       clearCodePrefixes: [...SHOT_VALIDATOR_CODE_PREFIXES],
     });
-  }, [activeStoryboardId, edges, nodes, recordShotValidatorViolationsMutation]);
+  }, [
+    activeStoryboardId,
+    continuityBundle,
+    edges,
+    nodes,
+    recordShotValidatorViolationsMutation,
+  ]);
 
   const handleResolveViolation = useCallback(
     async (violationId: string, status: "acknowledged" | "resolved") => {
@@ -1785,6 +1903,132 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
       cherryPickCommitMutation,
       createApprovalTaskMutation,
       resolveApprovalTaskMutation,
+    ],
+  );
+
+  // M9 Phase 3 — promote a variant to primary.
+  //
+  // 1) Record producer approval for the merge.
+  // 2) Run applyMergePolicy(source=variantBranch, target=defaultBranch,
+  //    policy="pick_variant"). The target gets a new commit replaying
+  //    the variant branch's ops; variant branch itself is left active
+  //    so rollback remains trivial.
+  // 3) Flip `producerPicked=true` on the narrativeVariants row so the
+  //    panel renders the Trophy badge + hides the Pick button.
+  // 4) De-pin the variant from the compare pair (it's now on main).
+  //
+  // Sibling variants are NOT archived here — the 14-day cron in
+  // convex/crons.ts reaps unpicked candidates. Producers who want
+  // explicit cleanup can archive branches via the existing branch UI.
+  const handlePromoteVariant = useCallback(
+    async (variant: NarrativeVariantRecord) => {
+      if (!activeStoryboardId) return;
+      const target = defaultBranchId;
+      const approvalTaskId = await createApprovalTaskMutation({
+        storyboardId: activeStoryboardId,
+        taskType: "merge_policy",
+        title: `Pick variant ${variant.branchId}`,
+        rationale: `Producer promoted ${variant.variantType} variant`,
+        diffSummary: `Merge ${variant.branchId} → ${target}`,
+        payloadJson: JSON.stringify({
+          sourceBranchId: variant.branchId,
+          targetBranchId: target,
+          policy: "pick_variant",
+        }),
+      });
+      await resolveApprovalTaskMutation({
+        taskId: approvalTaskId,
+        approved: true,
+        justification: "Approved from Variant Compare",
+      });
+      await applyMergePolicyFromPageMutation({
+        storyboardId: activeStoryboardId,
+        sourceBranchId: variant.branchId,
+        targetBranchId: target,
+        policy: "pick_variant",
+        approvalToken: `approved:${String(approvalTaskId)}`,
+      });
+      await markVariantPickedMutation({
+        storyboardId: activeStoryboardId,
+        branchId: variant.branchId,
+      });
+      setCompareBranchIds((prev) =>
+        prev.filter((b) => b !== variant.branchId),
+      );
+    },
+    [
+      activeStoryboardId,
+      defaultBranchId,
+      createApprovalTaskMutation,
+      resolveApprovalTaskMutation,
+      applyMergePolicyFromPageMutation,
+      markVariantPickedMutation,
+    ],
+  );
+
+  // M9 Phase 5 — producer-authored motif plant. Handles the merge
+  // semantics that the HITL card does: if a row exists, we append
+  // the target node to the right array (sources for plant, payoffs
+  // for payoff) and recompute landedStatus. Also patches the
+  // target node's motifIds[] so visual_director sees the plant.
+  const handlePlantMotif = useCallback(
+    async (input: {
+      motifKey: string;
+      description: string;
+      targetNodeId: string;
+      role: "plant" | "payoff";
+      visualVocabulary?: string;
+    }) => {
+      if (!activeStoryboardId) return;
+      const existing = (narrativeMotifs ?? []).find(
+        (m) => m.motifKey === input.motifKey,
+      );
+      const sources = new Set(existing?.sourceNodeIds ?? []);
+      const payoffs = new Set(existing?.payoffNodeIds ?? []);
+      if (input.role === "plant") {
+        sources.add(input.targetNodeId);
+      } else {
+        payoffs.add(input.targetNodeId);
+      }
+      const hasSrc = sources.size > 0;
+      const hasPay = payoffs.size > 0;
+      const landedStatus: "unplanted" | "planted" | "landed" =
+        hasSrc && hasPay
+          ? "landed"
+          : hasSrc || hasPay
+            ? "planted"
+            : "unplanted";
+      await upsertMotifFromPageMutation({
+        storyboardId: activeStoryboardId,
+        motifKey: input.motifKey,
+        description: input.description,
+        sourceNodeIds: Array.from(sources),
+        payoffNodeIds: Array.from(payoffs),
+        visualVocabulary:
+          input.visualVocabulary ?? existing?.visualVocabulary ?? undefined,
+        landedStatus,
+      });
+      // Append motif key to the target node's motifIds[] so
+      // visual_director picks it up on the next media-prompt pass.
+      // setNodeNarrativeFields patches the node; if motifIds was
+      // empty, this seeds it, otherwise it appends uniquely.
+      const targetNode = nodes.find((n) => n.id === input.targetNodeId);
+      const existingMotifIds = targetNode?.data.motifIds ?? [];
+      const mergedMotifIds = Array.from(
+        new Set([...existingMotifIds, input.motifKey]),
+      );
+      await setNodeNarrativeFieldsFromPageMutation({
+        storyboardId: activeStoryboardId,
+        nodeId: input.targetNodeId,
+        motifIds: mergedMotifIds,
+      });
+    },
+    [
+      activeStoryboardId,
+      narrativeMotifs,
+      nodes,
+      upsertMotifFromPageMutation,
+      setNodeNarrativeFieldsFromPageMutation,
     ],
   );
 
@@ -2193,6 +2437,18 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
             canRedo={redoDepth > 0}
           />
 
+          {/* M9 Phase 2 — narrative analysis strip. Mounted above the
+              canvas as a floating overlay; scoped to the active
+              storyboard so viewer-scope (no storyboardId) skips it
+              entirely. */}
+          {activeStoryboardId ? (
+            <NarrativeBar
+              storyboardId={activeStoryboardId}
+              nodes={nodes}
+              onFocusNode={focusNode}
+            />
+          ) : null}
+
           <div className="absolute right-4 top-4 z-20 flex items-center gap-2">
             <div className="rounded-md border border-border/60 bg-background/80 px-2 py-1 text-[11px] text-muted-foreground">
               {saveStatusText}
@@ -2223,6 +2479,10 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
               disabled={!activeStoryboardId || !snapshot}
             />
             <GenerateAllAudiosButton
+              storyboardId={activeStoryboardId ?? ""}
+              disabled={!activeStoryboardId || !snapshot}
+            />
+            <GenerateAllSfxsButton
               storyboardId={activeStoryboardId ?? ""}
               disabled={!activeStoryboardId || !snapshot}
             />
@@ -2286,6 +2546,14 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
               onPublishIdentityPack={handlePublishIdentityPack}
               onSetIdentityPackVoice={handleSetIdentityPackVoice}
               identityPortraitCallbacks={identityPortraitCallbacks}
+              variants={narrativeVariants ?? []}
+              compareBranchIds={compareBranchIds}
+              onToggleCompareBranch={toggleCompareBranch}
+              onPromoteVariant={handlePromoteVariant}
+              motifs={narrativeMotifs ?? []}
+              onFocusNode={focusNode}
+              shotNodes={nodes.filter((n) => n.data.nodeType === "shot")}
+              onPlantMotif={handlePlantMotif}
             />
           </div>
 
@@ -2369,6 +2637,12 @@ function AppContent({ storyboardIdOverride }: StoryboardPageProps) {
           open={reelOpen}
           onOpenChange={setReelOpen}
           storyboardId={activeStoryboardId}
+          compareBranchIds={compareBranchIds}
+          compareBranches={(branches ?? []).map((b) => ({
+            branchId: b.branchId,
+            name: b.name,
+            headCommitId: b.headCommitId,
+          }))}
         />
       ) : null}
     </div>

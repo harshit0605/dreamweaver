@@ -45,10 +45,74 @@ const setupMutationSpies = () => {
   mutationSpyRegistry.clear();
   mutationSpyRegistry.set("approvals:createTask", createMutationSpy(() => "task_1"));
   mutationSpyRegistry.set("approvals:resolveTask", createMutationSpy(() => "task_1"));
+  // markExecutionStarted/Finished bracket every HITL approval so the
+  // UI can show "executing…" vs a final status. Both return the
+  // approval task id unchanged.
+  mutationSpyRegistry.set(
+    "approvals:markExecutionStarted",
+    createMutationSpy(() => "task_1"),
+  );
+  mutationSpyRegistry.set(
+    "approvals:markExecutionFinished",
+    createMutationSpy(() => "task_1"),
+  );
   mutationSpyRegistry.set("storyboards:applyGraphPatch", createMutationSpy(() => ({ touchedNodeIds: ["node_1"] })));
   mutationSpyRegistry.set("storyboards:recordStoryEvent", createMutationSpy(() => "event_1"));
   mutationSpyRegistry.set("storyboards:refreshNodeHistoryContexts", createMutationSpy(() => ({ refreshed: 1 })));
   mutationSpyRegistry.set("mediaAssets:createMediaAsset", createMutationSpy(() => "media_1"));
+  // revertBatchMediaAssets rolls back a batch when the producer rejects
+  // mid-batch. Returns the number of assets reverted.
+  mutationSpyRegistry.set(
+    "mediaAssets:revertBatchMediaAssets",
+    createMutationSpy(() => ({ reverted: 0 })),
+  );
+  // M6 — per-character TTS voice assignment. Returns the pack id so
+  // the caller can chain UI refreshes; the spy just echoes the input.
+  mutationSpyRegistry.set(
+    "continuityOS:setIdentityPackVoice",
+    createMutationSpy(() => "pack_1"),
+  );
+  // M8 — reel-level score attach; called after createMediaAsset in the
+  // request_generate_score handler. Returns a trivial ack.
+  mutationSpyRegistry.set(
+    "storyboards:setStoryboardScore",
+    createMutationSpy(() => ({
+      storyboardId: "sb_1",
+      volumeDb: -18,
+    })),
+  );
+  // M9 Phase 2 — beat-assignment approval flow. `setNodeNarrativeFields`
+  // patches each assigned shot's beatType + actNumber;
+  // `upsertBeatPlan` persists the plan row keyed by (storyboard, branch).
+  mutationSpyRegistry.set(
+    "narrativeState:setNodeNarrativeFields",
+    createMutationSpy((args) => ({ nodeId: String(args.nodeId ?? "") })),
+  );
+  mutationSpyRegistry.set(
+    "narrativeState:upsertBeatPlan",
+    createMutationSpy(() => "beat_plan_1"),
+  );
+  // M9 Phase 3 — hook + remix variants commit N narrative-git branches
+  // on approve. createBranch is idempotent, commitPlanOps writes the
+  // variant's ops to that branch, upsertVariant records metadata so
+  // Variant Compare can enumerate candidates.
+  mutationSpyRegistry.set(
+    "narrativeGit:createBranch",
+    createMutationSpy((args) => args.branchId ?? "branch_1"),
+  );
+  mutationSpyRegistry.set(
+    "narrativeState:upsertVariant",
+    createMutationSpy((args) => `variant_${String(args.branchId ?? "v")}`),
+  );
+  // M9 Phase 4 — transition + motif mutations for the new HITL handlers.
+  mutationSpyRegistry.set(
+    "narrativeState:setEdgeTransitionIntent",
+    createMutationSpy((args) => ({ edgeId: String(args.edgeId ?? "") })),
+  );
+  mutationSpyRegistry.set(
+    "narrativeState:upsertMotif",
+    createMutationSpy((args) => `motif_${String(args.motifKey ?? "m")}`),
+  );
   mutationSpyRegistry.set(
     "storyboards:compileNodePromptPack",
     createMutationSpy((args) => ({
@@ -99,6 +163,18 @@ const setupMutationSpies = () => {
     })),
   );
   mutationSpyRegistry.set("dailies:updateDailiesStatus", createMutationSpy(() => "reel_1"));
+  // Autonomous dailies path also writes the raw agent output via
+  // upsertAgentDailies; simulation critic runs write via
+  // upsertAgentSimulationRun. Both are side-effect mutations with no
+  // interesting return value for the bridge.
+  mutationSpyRegistry.set(
+    "dailies:upsertAgentDailies",
+    createMutationSpy(() => "reel_1"),
+  );
+  mutationSpyRegistry.set(
+    "dailies:upsertAgentSimulationRun",
+    createMutationSpy(() => "sim_1"),
+  );
   mutationSpyRegistry.set(
     "dailies:runSimulationCritic",
     createMutationSpy(() => ({
@@ -181,6 +257,37 @@ mock.module("convex/react", () => {
       }
       return entry.fn;
     },
+    // bun's mock.module is process-wide, not file-scoped — once any test
+    // in the run registers this mock, every subsequent import of
+    // `convex/react` in OTHER test files resolves to this stub. Without
+    // a `useQuery` export here, sibling tests that only needed
+    // useQuery explode with "Export named 'useQuery' not found" during
+    // module evaluation. Providing a no-op useQuery keeps those tests
+    // loading cleanly; the mock stub returns `undefined` which the
+    // production code already treats as "loading".
+    useQuery: () => undefined,
+  };
+});
+
+// Pre-existing: the bridge calls `useRouter()` at module mount. Without
+// this mock next/navigation throws 'invariant expected app router to be
+// mounted' because jsdom + @testing-library/react doesn't set up the
+// Next app-router context. We only stub the methods the bridge actually
+// calls — push() for programmatic navigation; the rest are present so
+// any future addition keeps working without a test change.
+mock.module("next/navigation", () => {
+  return {
+    useRouter: () => ({
+      push: () => undefined,
+      replace: () => undefined,
+      prefetch: () => undefined,
+      back: () => undefined,
+      forward: () => undefined,
+      refresh: () => undefined,
+    }),
+    usePathname: () => "/",
+    useSearchParams: () => new URLSearchParams(),
+    useParams: () => ({}),
   };
 });
 
@@ -811,5 +918,481 @@ describe("StoryboardCopilotBridge UI integration", () => {
 
     expect(responses[0]?.approved).toBe(true);
     expect(mutationSpyRegistry.get("agentTeams:assignTeamToStoryboard")?.calls.length).toBe(1);
+  });
+
+  // ===========================================================================
+  // M9.5 L3 — bridge scenarios for the 5 M9 HITL cards
+  // ===========================================================================
+  //
+  // Each scenario follows the existing pattern:
+  //   1. mount the bridge → resolve the registered HITL handler
+  //   2. invoke render() with synthetic agent args
+  //   3. simulate Approve (or Edit / Reject) on the rendered card
+  //   4. assert the mutation chain spy registered the right calls
+  //
+  // What we're testing: the BRIDGE↔CONVEX contract. The agent side is
+  // covered by the L2 routing tests in storyboard-agent/tests/. The
+  // panel-level UX (NarrativeBar drag, MotifMapPanel form, Variant
+  // Compare promote) is in dedicated integration test files.
+
+  it("wires request_beat_assignment approve button to setNodeNarrativeFields + upsertBeatPlan chain", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_beat_assignment");
+    expect(hitl).toBeDefined();
+    if (!hitl) throw new Error("request_beat_assignment not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        branchId: "main",
+        structure: "save_the_cat",
+        assignments: [
+          { nodeId: "node_1", beatKey: "opening_image", actNumber: 1 },
+          { nodeId: "node_2", beatKey: "catalyst", actNumber: 1 },
+        ],
+        rationale: "Producer asked for a beat pass.",
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Approve"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(true);
+    // Two assignments → two setNodeNarrativeFields calls in order;
+    // then exactly one upsertBeatPlan that replaces the row.
+    const fieldsSpy = mutationSpyRegistry.get("narrativeState:setNodeNarrativeFields");
+    expect(fieldsSpy?.calls.length).toBe(2);
+    expect(fieldsSpy?.calls[0]?.nodeId).toBe("node_1");
+    expect(fieldsSpy?.calls[0]?.beatType).toBe("opening_image");
+    expect(fieldsSpy?.calls[1]?.nodeId).toBe("node_2");
+    expect(fieldsSpy?.calls[1]?.beatType).toBe("catalyst");
+
+    const planSpy = mutationSpyRegistry.get("narrativeState:upsertBeatPlan");
+    expect(planSpy?.calls.length).toBe(1);
+    expect(planSpy?.calls[0]?.structure).toBe("save_the_cat");
+    expect(planSpy?.calls[0]?.branchId).toBe("main");
+    const beats = planSpy?.calls[0]?.beats as Array<Record<string, unknown>>;
+    expect(Array.isArray(beats)).toBe(true);
+    expect(beats.length).toBe(2);
+    expect(beats[0]?.status).toBe("assigned");
+  });
+
+  it("wires request_hook_variants approve button to createBranch + commitPlanOps + upsertVariant per variant", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_hook_variants");
+    expect(hitl).toBeDefined();
+    if (!hitl) throw new Error("request_hook_variants not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        parentBranchId: "main",
+        variantCount: 3,
+        rationale: "Three short-form cold opens.",
+        variants: [
+          {
+            variantId: "question",
+            rationale: "Open on an unanswered question.",
+            expectedRetention: "high",
+            branchName: "Hook variant question",
+            planOps: [
+              {
+                op: "create_node",
+                title: "Question hook shot",
+                rationale: "Provoke curiosity.",
+              },
+            ],
+          },
+          {
+            variantId: "stakes",
+            rationale: "Reveal the threat up front.",
+            expectedRetention: "high",
+            branchName: "Hook variant stakes",
+            planOps: [
+              {
+                op: "create_node",
+                title: "Stakes hook shot",
+                rationale: "Worst-case reveal.",
+              },
+            ],
+          },
+          {
+            variantId: "rhyme",
+            rationale: "Match-cut into act 1.",
+            expectedRetention: "experimental",
+            branchName: "Hook variant rhyme",
+            planOps: [
+              {
+                op: "create_node",
+                title: "Visual rhyme hook",
+                rationale: "Match cut.",
+              },
+            ],
+          },
+        ],
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Approve"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(true);
+    expect(responses[0]?.variantType).toBe("hook");
+    // 3 variants × full chain — createBranch, commitPlanOps,
+    // upsertVariant each fire 3 times.
+    expect(mutationSpyRegistry.get("narrativeGit:createBranch")?.calls.length).toBe(3);
+    expect(mutationSpyRegistry.get("narrativeGit:commitPlanOps")?.calls.length).toBe(3);
+    expect(mutationSpyRegistry.get("narrativeState:upsertVariant")?.calls.length).toBe(3);
+
+    // Branch ids follow the variant/hook-<id> convention.
+    const branchSpy = mutationSpyRegistry.get("narrativeGit:createBranch");
+    const branchIds = branchSpy?.calls.map((c) => c.branchId);
+    expect(branchIds).toEqual([
+      "variant/hook-question",
+      "variant/hook-stakes",
+      "variant/hook-rhyme",
+    ]);
+
+    // Each variant marked as type="hook" so listVariants can group.
+    const variantSpy = mutationSpyRegistry.get("narrativeState:upsertVariant");
+    for (const call of variantSpy?.calls ?? []) {
+      expect(call.variantType).toBe("hook");
+      expect(call.parentBranchId).toBe("main");
+    }
+  });
+
+  it("wires request_structural_remix approve button to the same chain with variantType=remix", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_structural_remix");
+    expect(hitl).toBeDefined();
+    if (!hitl) throw new Error("request_structural_remix not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        parentBranchId: "main",
+        targetStructure: "harmon_circle",
+        variantCount: 2,
+        rationale: "Reframe to Harmon circle.",
+        variants: [
+          {
+            variantId: "in-medias-res",
+            strategy: "in_medias_res",
+            rationale: "Open mid-act-2.",
+            branchName: "Remix harmon_circle in-medias-res",
+            planOps: [
+              {
+                op: "update_node",
+                title: "Reorder n1 to act 2 midpoint",
+                nodeId: "node_1",
+              },
+            ],
+          },
+          {
+            variantId: "harmon-reframe",
+            strategy: "harmon_reframe",
+            rationale: "Strict 8-beat circle.",
+            branchName: "Remix harmon_circle harmon-reframe",
+            planOps: [
+              {
+                op: "update_node",
+                title: "Move catalyst to circle beat 'go'",
+                nodeId: "node_2",
+              },
+            ],
+          },
+        ],
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Approve"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(true);
+    expect(responses[0]?.variantType).toBe("remix");
+    expect(mutationSpyRegistry.get("narrativeGit:createBranch")?.calls.length).toBe(2);
+    expect(mutationSpyRegistry.get("narrativeGit:commitPlanOps")?.calls.length).toBe(2);
+    expect(mutationSpyRegistry.get("narrativeState:upsertVariant")?.calls.length).toBe(2);
+    // Remix branch ids follow the variant/remix-<structure>-<id> convention.
+    const branchIds = mutationSpyRegistry
+      .get("narrativeGit:createBranch")
+      ?.calls.map((c) => c.branchId);
+    expect(branchIds).toEqual([
+      "variant/remix-harmon_circle-in-medias-res",
+      "variant/remix-harmon_circle-harmon-reframe",
+    ]);
+    // variantType normalised to "remix" for narrativeVariants table.
+    const variantTypes = mutationSpyRegistry
+      .get("narrativeState:upsertVariant")
+      ?.calls.map((c) => c.variantType);
+    expect(variantTypes).toEqual(["remix", "remix"]);
+  });
+
+  it("wires request_transition_proposal approve button to setEdgeTransitionIntent (selecting the rank-1 proposal by default)", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    // The graph has edge e1 from node_1 → node_2; the bridge looks up
+    // by (source, target) so we drive the agent payload with those ids.
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_transition_proposal");
+    expect(hitl).toBeDefined();
+    if (!hitl) throw new Error("request_transition_proposal not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        branchId: "main",
+        sourceNodeId: "node_1",
+        targetNodeId: "node_2",
+        proposalCount: 2,
+        rationale: "Producer asked for transitions.",
+        proposals: [
+          {
+            intent: "match_cut",
+            rationale: "Crimson umbrella bridges the cut.",
+            sharedElement: "crimson umbrella",
+            rank: 1,
+          },
+          {
+            intent: "j_cut",
+            rationale: "Audio leads picture.",
+            rank: 2,
+          },
+        ],
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Approve"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(true);
+    expect(responses[0]?.selectedIntent).toBe("match_cut");
+    expect(responses[0]?.edgeId).toBe("e1");
+
+    const intentSpy = mutationSpyRegistry.get("narrativeState:setEdgeTransitionIntent");
+    expect(intentSpy?.calls.length).toBe(1);
+    expect(intentSpy?.calls[0]?.edgeId).toBe("e1");
+    expect(intentSpy?.calls[0]?.transitionIntent).toBe("match_cut");
+
+    // Approval task still gets created so the audit trail records the pick.
+    expect(mutationSpyRegistry.get("approvals:createTask")?.calls.length).toBe(1);
+    expect(mutationSpyRegistry.get("approvals:resolveTask")?.calls.length).toBe(1);
+  });
+
+  it("wires request_motif_plant approve button to upsertMotif with derived landedStatus", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_motif_plant");
+    expect(hitl).toBeDefined();
+    if (!hitl) throw new Error("request_motif_plant not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    // Plant motif at node_1 (source) with a payoff at node_2 already
+    // declared → derived landedStatus is "landed" (both arrays
+    // populated). Mirrors detect_motif_gaps on the agent side.
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        branchId: "main",
+        motifKey: "red-umbrella",
+        targetNodeId: "node_1",
+        description: "Recurring crimson umbrella.",
+        visualVocabulary: "crimson fabric, rain-beaded",
+        sourceNodeIds: ["node_1"],
+        payoffNodeIds: ["node_2"],
+        planOps: [
+          {
+            op: "update_node",
+            title: "Plant red umbrella at node_1",
+            nodeId: "node_1",
+          },
+        ],
+        rationale: "Land setup + payoff in one pass.",
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Approve"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(true);
+    expect(responses[0]?.motifKey).toBe("red-umbrella");
+    expect(responses[0]?.landedStatus).toBe("landed");
+
+    // commitPlanOps fires once for the planOps; upsertMotif fires once.
+    expect(mutationSpyRegistry.get("narrativeGit:commitPlanOps")?.calls.length).toBe(1);
+    const motifSpy = mutationSpyRegistry.get("narrativeState:upsertMotif");
+    expect(motifSpy?.calls.length).toBe(1);
+    expect(motifSpy?.calls[0]?.motifKey).toBe("red-umbrella");
+    expect(motifSpy?.calls[0]?.landedStatus).toBe("landed");
+    expect(motifSpy?.calls[0]?.sourceNodeIds).toEqual(["node_1"]);
+    expect(motifSpy?.calls[0]?.payoffNodeIds).toEqual(["node_2"]);
+    expect(motifSpy?.calls[0]?.visualVocabulary).toBe(
+      "crimson fabric, rain-beaded",
+    );
+  });
+
+  it("wires request_motif_plant reject button to no mutations + blockedReason", async () => {
+    const { StoryboardCopilotBridge } = await import("@/components/storyboard/StoryboardCopilotBridge");
+    const { nodes, edges } = createGraph();
+
+    render(
+      <StoryboardCopilotBridge
+        storyboardId="storyboard_1"
+        nodes={nodes}
+        edges={edges}
+        approvals={[]}
+        mode="graph_studio"
+        runtimeResolvedTeam={runtimeTeam}
+        userIdentity={null}
+      />,
+    );
+
+    const hitl = hitlRegistry.get("request_motif_plant");
+    if (!hitl) throw new Error("request_motif_plant not registered");
+
+    const responses: Record<string, unknown>[] = [];
+    const card = hitl.render({
+      status: "executing",
+      args: {
+        storyboardId: "storyboard_1",
+        branchId: "main",
+        motifKey: "red-umbrella",
+        targetNodeId: "node_1",
+        description: "x",
+        visualVocabulary: "x",
+        sourceNodeIds: ["node_1"],
+        payoffNodeIds: [],
+        planOps: [],
+        rationale: "x",
+      },
+      respond: (payload) => {
+        responses.push(payload);
+      },
+    });
+
+    const cardView = render(card);
+    fireEvent.click(cardView.getByText("Reject"));
+
+    await waitFor(() => {
+      expect(responses.length).toBe(1);
+    });
+
+    expect(responses[0]?.approved).toBe(false);
+    expect(typeof responses[0]?.blockedReason).toBe("string");
+    // No mutations on reject — the audit trail records the blocked
+    // decision via toolAudits, not via the motif registry.
+    expect(mutationSpyRegistry.get("narrativeState:upsertMotif")?.calls.length).toBe(0);
+    expect(mutationSpyRegistry.get("narrativeGit:commitPlanOps")?.calls.length).toBe(0);
   });
 });

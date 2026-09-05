@@ -182,6 +182,73 @@ export const buildConcatArgs = (
 ];
 
 /**
+ * M7 — build the ffmpeg argv that burns a WebVTT/SRT subtitle file into
+ * the reel video. Re-encodes the video stream (unavoidable for burn-in)
+ * at the same preset the normalize pass uses, and stream-copies audio
+ * so the narration isn't touched.
+ *
+ * ffmpeg's `subtitles` filter requires a local file path. The caller
+ * must have written the SRT/VTT to `subtitlePath` before spawning.
+ *
+ * The filter escapes `subtitlePath`'s single quotes to match the
+ * filter-graph syntax — embedded `'` inside a value is a common
+ * foot-gun.
+ */
+/** Escape a path value for libav's filter-graph quoted syntax.
+ *  Backslash, colon, and single-quote all need doubling/escaping or
+ *  the filter parser mis-tokenizes. Shared between the subtitle path
+ *  and the fontsdir path. */
+const escapeFilterPathValue = (path: string): string =>
+  path.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
+
+export const buildBurnInSubtitlesArgs = (input: {
+  videoPath: string;
+  subtitlePath: string;
+  outputPath: string;
+  /** M7 — libass style overrides applied via `force_style`. Pre-built
+   *  by `buildForceStyleString` in @/lib/subtitles. Empty string means
+   *  "use libass defaults". */
+  forceStyle?: string;
+  /** M7 — directory libass should scan for custom font files (.ttf /
+   *  .otf). Passed through as the filter's `fontsdir=` option. When
+   *  absent, libass falls back to the system font set — which varies
+   *  by deploy target and is why this option exists. Typical host
+   *  setup: drop a few ttf files into `SUBTITLE_FONTS_DIR` and the
+   *  producer can set `fontFamily: "Inter"` and trust it across every
+   *  deploy. */
+  fontsDir?: string;
+}): string[] => {
+  const { videoPath, subtitlePath, outputPath, forceStyle, fontsDir } = input;
+  // Escape single quotes for the filter value syntax. ffmpeg's filter
+  // parser uses `'...'` as a quoted value; we end the string, escape,
+  // and reopen. `:` inside the path also needs escaping to avoid
+  // splitting filter args. Windows drive letters aren't a concern in
+  // our tmpdir usage but handled for completeness.
+  let filter = `subtitles='${escapeFilterPathValue(subtitlePath)}'`;
+  if (forceStyle && forceStyle.trim().length > 0) {
+    // Escape any embedded single quotes in the style string; libass
+    // parses force_style as a comma-separated KEY=VALUE list, and the
+    // outer `'…'` in the filter would otherwise terminate early.
+    const escapedStyle = forceStyle.replace(/'/g, "\\'");
+    filter += `:force_style='${escapedStyle}'`;
+  }
+  if (fontsDir && fontsDir.trim().length > 0) {
+    filter += `:fontsdir='${escapeFilterPathValue(fontsDir)}'`;
+  }
+  return [
+    "-y",
+    "-i", videoPath,
+    "-vf", filter,
+    "-c:v", REEL_TARGET_VCODEC,
+    "-preset", REEL_TARGET_PRESET,
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    outputPath,
+  ];
+};
+
+/**
  * Serialize a list of local shot paths into the ffmpeg concat demuxer's
  * format. Paths are wrapped in single-quoted `file '...'` entries and
  * internal single quotes are escaped as `'\''`.
@@ -201,6 +268,11 @@ export interface ShotPlan {
   willDownloadVideo: boolean;
   willDownloadImage: boolean;
   willDownloadAudio: boolean;
+  /** M7 — SFX (ambient / foley) download flag. Independent of the
+   *  narration download: a shot can have SFX without narration (pure
+   *  ambient), narration without SFX (most common), or both (premixed
+   *  during normalization). */
+  willDownloadSfx: boolean;
 }
 
 /**
@@ -229,6 +301,13 @@ export const planShotDownloads = (shots: ReelShot[]): ShotPlan[] =>
     } else {
       kind = "silent_black";
     }
+    // SFX is always a supplement to the shot's audio track. We only
+    // download when we'll actually use it — shots going down the
+    // silent_black branch have nowhere to render an audio track, so
+    // the SFX is dropped with a warning (producers should attach an
+    // image or video first).
+    const willDownloadSfx =
+      Boolean(shot.sfxUrl) && kind !== "silent_black";
     return {
       shot,
       index,
@@ -236,5 +315,6 @@ export const planShotDownloads = (shots: ReelShot[]): ShotPlan[] =>
       willDownloadVideo,
       willDownloadImage,
       willDownloadAudio,
+      willDownloadSfx,
     };
   });

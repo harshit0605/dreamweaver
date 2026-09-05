@@ -18,6 +18,8 @@ const mkShot = (overrides: Partial<ReelShot> = {}): ReelShot => ({
   videoUrl: null,
   imageUrl: null,
   audioUrl: null,
+  sfxUrl: null,
+  sfxVolumeDb: null,
   prompt: null,
   ...overrides,
 });

@@ -66,6 +66,8 @@ describe("runShotValidators", () => {
       "SHOT_SCREEN_DIRECTION_REVERSE",
       "SHOT_THIRTY_DEGREE_RULE",
       "SHOT_EYELINE_MISMATCH",
+      "SHOT_SPEAKER_VOICE_MISSING",
+      "SHOT_SPEAKER_VOICE_MISMATCH",
     ]);
   });
 });

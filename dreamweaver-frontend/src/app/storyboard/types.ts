@@ -76,7 +76,11 @@ export const LENS_MM_PRESETS: number[] = [14, 18, 24, 28, 35, 40, 50, 65, 85, 10
 
 export interface MediaVariant {
   id: string;
-  kind: "image" | "video";
+  // M7 — widen the kind union so audio (narration TTS) and sfx
+  // (ambient / foley) variants flow through the same array shape as
+  // images + videos. Keeps `mapNodeMedia` simple and lets downstream
+  // code use one MediaVariant type across kinds.
+  kind: "image" | "video" | "audio" | "sfx";
   url: string;
   modelId: string;
   prompt: string;
@@ -139,8 +143,16 @@ export interface StoryNodeData {
   media: {
     images: MediaVariant[];
     videos: MediaVariant[];
+    // M7 — audio (narration TTS) and sfx (ambient/foley) variants. Both
+    // optional because most legacy storyboards don't have them; the
+    // ReelPlayer + PropertiesPanel render the SFX surface only when
+    // `sfxs` is non-empty or the producer wants to generate one.
+    audios?: MediaVariant[];
+    sfxs?: MediaVariant[];
     activeImageId?: string;
     activeVideoId?: string;
+    activeAudioId?: string;
+    activeSfxId?: string;
   };
 
   // Legacy fields kept for UI compatibility while migrating to media[] variants.
@@ -150,6 +162,16 @@ export interface StoryNodeData {
   audio?: string;
   video?: string;
   isProcessing?: boolean;
+  // M9 — narrative refinement fields. All optional; populated by the
+  // NarrativeBar's Analyze pass or by the beat_analyst subagent via
+  // request_beat_assignment. Free-form strings because the beat
+  // vocabulary varies by structure and is validated at the route
+  // boundary rather than in TS.
+  beatType?: string;
+  actNumber?: number;
+  tensionLevel?: number;
+  motifIds?: string[];
+  hookType?: string;
   processingTask?: string; // 'text' | 'image' | 'audio' | 'video'
 }
 
@@ -549,6 +571,37 @@ export interface NarrativeCommitRecord {
   parentCommitId?: string;
   reviewRound?: number;
   createdAt: number;
+}
+
+// M9 Phase 4 — motif registry. Populated by motif_tracker via
+// request_motif_plant. `landedStatus` is derived server-side from
+// sources/payoffs presence; the MotifMapPanel renders setup → payoff
+// chains using this view.
+export interface NarrativeMotifRecord {
+  _id: string;
+  motifKey: string;
+  description: string;
+  sourceNodeIds: string[];
+  payoffNodeIds: string[];
+  visualVocabulary?: string;
+  landedStatus: "unplanted" | "planted" | "landed";
+  createdAt: number;
+  updatedAt: number;
+}
+
+// M9 Phase 3 — narrative variant catalog. Each row links a
+// narrative-git branch (via branchId) to its generator + rationale so
+// Variant Compare can enumerate candidates without re-scanning commits.
+export interface NarrativeVariantRecord {
+  _id: string;
+  branchId: string;
+  variantType: "hook" | "structural" | "transition" | "remix";
+  rationale: string;
+  generatedByRunId?: string;
+  producerPicked: boolean;
+  parentBranchId?: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export type { CutTier } from "@/lib/cut-tier";

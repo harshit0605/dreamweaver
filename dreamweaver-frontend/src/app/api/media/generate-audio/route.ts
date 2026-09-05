@@ -42,6 +42,12 @@ interface GenerateAudioBody {
   model?: string;
   /** OpenAI TTS speed, 0.25–4.0. Defaults to 1.0. */
   speed?: number;
+  /** M8 — ElevenLabs voice clone id. When present AND
+   *  `ELEVENLABS_API_KEY` is configured, the route skips OpenAI TTS
+   *  and generates via ElevenLabs using this voice. Falls back to
+   *  OpenAI (with `voice`) on provider error or missing key so a
+   *  missing config downgrade quality rather than fail the batch. */
+  elevenlabsVoiceId?: string;
 }
 
 interface GenerateAudioResponse {
@@ -51,7 +57,78 @@ interface GenerateAudioResponse {
   model: string;
   speed: number;
   byteLength: number;
+  /** Provider that actually produced the mp3. Useful for observability
+   *  when a clone request falls back to OpenAI. */
+  provider: "openai" | "elevenlabs";
 }
+
+/** Call OpenAI TTS. Extracted so the provider-routing block below
+ *  can retry the OpenAI path after an ElevenLabs fallback without
+ *  duplicating the fetch body. */
+const fetchOpenAiTts = async (
+  apiKey: string,
+  input: { model: string; voice: string; text: string; speed: number },
+): Promise<ArrayBuffer> => {
+  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: input.model,
+      voice: input.voice,
+      input: input.text,
+      speed: input.speed,
+      response_format: "mp3",
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `OpenAI TTS ${res.status}: ${errText.slice(0, 300)}`,
+    );
+  }
+  return res.arrayBuffer();
+};
+
+/** Call ElevenLabs TTS with a voice clone id. Returns raw mp3 bytes.
+ *  Throws on non-2xx so the caller can log + fall back. */
+const generateViaElevenLabs = async (
+  text: string,
+  voiceId: string,
+  apiKey: string,
+): Promise<ArrayBuffer> => {
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          // Stability 0.5 + similarity 0.75 are ElevenLabs' documented
+          // defaults for general narration. Producers who want tighter
+          // voice-match can fork this later.
+          stability: 0.5,
+          similarity_boost: 0.75,
+        },
+      }),
+    },
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `ElevenLabs TTS ${res.status}: ${errText.slice(0, 300)}`,
+    );
+  }
+  return res.arrayBuffer();
+};
 
 export async function POST(request: NextRequest): Promise<Response> {
   const requestId = resolveRequestId(request.headers);
@@ -119,44 +196,64 @@ export async function POST(request: NextRequest): Promise<Response> {
   const client = new ConvexHttpClient(convexUrl);
   client.setAuth(token);
 
-  // --- 1. OpenAI TTS ------------------------------------------------
+  // --- 1. TTS --------------------------------------------------------
+  // Provider selection: if the caller passed an ElevenLabs voice clone
+  // id AND the key is configured, route through ElevenLabs. Any
+  // ElevenLabs failure falls back to OpenAI so a provider outage
+  // degrades to the default voice instead of breaking the batch.
+  const elevenlabsKey = process.env.ELEVENLABS_API_KEY;
+  const requestedCloneId = (body.elevenlabsVoiceId ?? "").trim();
+  const useClone = requestedCloneId.length > 0 && Boolean(elevenlabsKey);
+
   const endTts = log.startTimer("tts_generate", {
     textLength: text.length,
     voice,
     model,
     speed,
+    provider: useClone ? "elevenlabs" : "openai",
+    cloneId: useClone ? requestedCloneId : undefined,
   });
   let audioBytes: ArrayBuffer;
+  let effectiveProvider: "openai" | "elevenlabs" = "openai";
   try {
-    const res = await fetch("https://api.openai.com/v1/audio/speech", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    if (useClone) {
+      try {
+        audioBytes = await generateViaElevenLabs(
+          text,
+          requestedCloneId,
+          elevenlabsKey as string,
+        );
+        effectiveProvider = "elevenlabs";
+      } catch (cloneErr) {
+        // Fall back to OpenAI rather than failing the whole request.
+        // The audio batch prefers a slightly-off voice over a missing
+        // shot.
+        log.warn("tts_clone_fallback_openai", {
+          cloneId: requestedCloneId,
+          error:
+            cloneErr instanceof Error ? cloneErr.message : String(cloneErr),
+        });
+        audioBytes = await fetchOpenAiTts(apiKey, {
+          model,
+          voice,
+          text,
+          speed,
+        });
+        effectiveProvider = "openai";
+      }
+    } else {
+      audioBytes = await fetchOpenAiTts(apiKey, {
         model,
         voice,
-        input: text,
+        text,
         speed,
-        // mp3 keeps the file small and is natively playable in the
-        // browser + ffmpeg-concat pipeline for the reel.
-        response_format: "mp3",
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      log.error("tts_api_error", {
-        status: res.status,
-        body: errText.slice(0, 300),
       });
-      return NextResponse.json(
-        { error: `OpenAI TTS ${res.status}: ${errText.slice(0, 300)}` },
-        { status: 502, headers: { "X-Request-Id": requestId } },
-      );
+      effectiveProvider = "openai";
     }
-    audioBytes = await res.arrayBuffer();
-    endTts({ byteLength: audioBytes.byteLength });
+    endTts({
+      byteLength: audioBytes.byteLength,
+      provider: effectiveProvider,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.error("tts_fetch_failed", { error: msg });
@@ -215,6 +312,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     model,
     speed,
     byteLength: audioBytes.byteLength,
+    provider: effectiveProvider,
   };
   return NextResponse.json(payload, {
     status: 200,

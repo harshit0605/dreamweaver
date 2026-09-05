@@ -37,6 +37,10 @@ interface MediaVariant {
   url: string;
   modelId: string;
   createdAt: number;
+  /** M7 — variant-level metadata. SFX variants carry `volumeDb`
+   *  (stringified) so the reel export can mix at the producer's
+   *  chosen level without an extra Convex lookup per shot. */
+  metadata?: Record<string, string>;
 }
 
 interface SnapshotNode {
@@ -50,9 +54,11 @@ interface SnapshotNode {
     images?: MediaVariant[];
     videos?: MediaVariant[];
     audios?: MediaVariant[];
+    sfxs?: MediaVariant[];
     activeImageId?: string;
     activeVideoId?: string;
     activeAudioId?: string;
+    activeSfxId?: string;
   };
 }
 
@@ -71,12 +77,35 @@ export interface ReelShot {
   videoUrl: string | null;
   imageUrl: string | null;
   audioUrl: string | null;
+  /** M7 — active SFX (ambient / foley) track for this shot. Mixed
+   *  UNDER the narration during reel export. `null` when the shot has
+   *  no SFX assigned. */
+  sfxUrl: string | null;
+  /** M7 — producer-chosen volume trim in dB for the active SFX.
+   *  `null` when no SFX or no volume metadata; the export pipeline
+   *  falls back to `DEFAULT_SFX_VOLUME_DB` in that case. */
+  sfxVolumeDb: number | null;
   prompt: string | null;
+}
+
+export interface ReelScoreTrack {
+  /** URL of the score mp3 stored in Convex `_storage`. */
+  url: string;
+  /** Mix level in dB. `null` → the export pipeline falls back to
+   *  DEFAULT_SCORE_VOLUME_DB. */
+  volumeDb: number | null;
+  /** Diagnostic — the prompt the producer used. Surfaced so the
+   *  ReelPlayer can show "Score: <prompt>" in its score panel. */
+  prompt: string;
 }
 
 export interface ReelManifest {
   storyboardId: string;
   title: string;
+  /** M8 — reel-level background music. `null` when no score is
+   *  attached; both the export pipeline and the in-browser player
+   *  treat that as "narration + SFX only". */
+  score?: ReelScoreTrack | null;
   totalDurationS: number;
   shots: ReelShot[];
 }
@@ -159,6 +188,20 @@ export const buildReelManifest = (
         shot.media?.audios,
         shot.media?.activeAudioId,
       ),
+      sfxUrl: resolveActiveMediaUrl(
+        shot.media?.sfxs,
+        shot.media?.activeSfxId,
+      ),
+      sfxVolumeDb: (() => {
+        const variants = shot.media?.sfxs;
+        const activeId = shot.media?.activeSfxId;
+        if (!variants || !activeId) return null;
+        const hit = variants.find((v) => v.mediaAssetId === activeId);
+        const raw = hit?.metadata?.volumeDb;
+        if (typeof raw !== "string") return null;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : null;
+      })(),
       prompt: shot.promptPack?.imagePrompt ?? shot.segment ?? null,
     };
   });
@@ -184,6 +227,12 @@ export async function GET(request: NextRequest): Promise<Response> {
       { status: 400, headers: { "X-Request-Id": requestId } },
     );
   }
+  // M8 — optional locale override. When non-source, we overlay each
+  // shot's narration with the dubbed mp3 from localeNarrations. Empty
+  // / en / en-* returns the source-language manifest unchanged.
+  const localeParam = (
+    request.nextUrl.searchParams.get("locale") ?? ""
+  ).trim();
 
   const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
   if (!convexUrl) {
@@ -212,6 +261,61 @@ export async function GET(request: NextRequest): Promise<Response> {
     snapshot.storyboard.title ?? "Untitled",
     shots,
   );
+
+  // M8 — swap in dubbed narration when a locale was requested. We
+  // run this BEFORE the score lookup so both writes land in the same
+  // manifest return below.
+  if (localeParam) {
+    const { isSourceLocale } = await import("@/lib/subtitles");
+    if (!isSourceLocale(localeParam)) {
+      try {
+        const dubs = (await client.query(
+          queryRef("localeNarrations:listForReel"),
+          { storyboardId, locale: localeParam },
+        )) as Array<{
+          nodeId: string;
+          sourceUrl: string;
+        }>;
+        const byNode = new Map(dubs.map((d) => [d.nodeId, d.sourceUrl]));
+        for (const shot of manifest.shots) {
+          const dubbed = byNode.get(shot.nodeId);
+          if (dubbed) {
+            shot.audioUrl = dubbed;
+          }
+        }
+      } catch {
+        // Non-fatal — fall back to source-language narration if the
+        // locale table is empty or errors.
+      }
+    }
+  }
+
+  // M8 — attach the reel-level score, if any. Parallel fetch is
+  // intentional: the query doesn't depend on anything above except
+  // the authenticated client.
+  try {
+    const score = (await client.query(
+      queryRef("storyboards:getStoryboardScore"),
+      { storyboardId },
+    )) as {
+      sourceUrl: string;
+      prompt: string;
+      volumeDb: number | null;
+    } | null;
+    if (score) {
+      manifest.score = {
+        url: score.sourceUrl,
+        volumeDb: score.volumeDb,
+        prompt: score.prompt,
+      };
+    } else {
+      manifest.score = null;
+    }
+  } catch {
+    // Non-fatal — a missing score just means no music layer.
+    manifest.score = null;
+  }
+
   log.info("reel_manifest_built", {
     storyboardId,
     shotCount: manifest.shots.length,
@@ -219,6 +323,7 @@ export async function GET(request: NextRequest): Promise<Response> {
     shotsWithVideo: manifest.shots.filter((s) => !!s.videoUrl).length,
     shotsWithImage: manifest.shots.filter((s) => !!s.imageUrl).length,
     shotsWithAudio: manifest.shots.filter((s) => !!s.audioUrl).length,
+    hasScore: Boolean(manifest.score),
   });
 
   return NextResponse.json(manifest, {

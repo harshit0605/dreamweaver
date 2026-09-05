@@ -1,2 +1,7 @@
 
 .env.local
+
+# M9.5 L6 — Playwright artifacts
+test-results/
+playwright-report/
+playwright/.cache/

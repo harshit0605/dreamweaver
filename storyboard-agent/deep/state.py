@@ -147,6 +147,75 @@ class TeamRuntimeConfig(TypedDict, total=False):
     runtimePolicy: RuntimePolicyConfig
 
 
+NarrativeStructure = Literal[
+    "save_the_cat",
+    "harmon_circle",
+    "three_act",
+    "kishotenketsu",
+    "hook_first",
+]
+
+BeatStatus = Literal["planned", "assigned", "missing"]
+
+LandedStatus = Literal["unplanted", "planted", "landed"]
+
+
+class BeatAssignment(TypedDict, total=False):
+    """Single slot in a beat plan. `beatKey` is the canonical key for
+    the chosen structure (e.g. "opening_image" for Save-the-Cat,
+    "you" for Harmon Circle, "hook" for hook-first). `nodeId` is
+    present when a storyboard node has been mapped to this slot;
+    absent when the slot is still planned but unassigned."""
+
+    beatKey: str
+    expectedActNumber: int
+    nodeId: str
+    status: BeatStatus
+    rationale: str
+
+
+class MotifEntry(TypedDict, total=False):
+    """One recurring element across the reel. `sourceNodeIds` are the
+    plants; `payoffNodeIds` the callbacks. `landedStatus` summarizes
+    whether every plant has a callback landed."""
+
+    motifKey: str
+    description: str
+    sourceNodeIds: List[str]
+    payoffNodeIds: List[str]
+    visualVocabulary: str
+    landedStatus: LandedStatus
+
+
+class TensionSample(TypedDict, total=False):
+    nodeId: str
+    value: float
+
+
+class CharacterArc(TypedDict, total=False):
+    characterId: str
+    want: str
+    need: str
+    arcStatus: str
+
+
+class ReelNarrativeState(TypedDict, total=False):
+    """M9 reel-scoped narrative memory. Mirrors the Convex
+    `reelNarrativeState` row for the (storyboard, branch) pair.
+    Hydrated at the start of each agent turn; mirrored back on exit.
+
+    All fields optional because first-run state (before the producer
+    clicks "Analyze narrative") is empty."""
+
+    structure: NarrativeStructure
+    beats: List[BeatAssignment]
+    motifs: Dict[str, MotifEntry]
+    tension_samples: List[TensionSample]
+    character_arcs: List[CharacterArc]
+    computed_from_commit_id: str
+    stale: bool
+
+
 class StoryboardDeepAgentState(TypedDict, total=False):
     messages: List[Dict[str, Any]]
     storyboard_id: str
@@ -179,3 +248,9 @@ class StoryboardDeepAgentState(TypedDict, total=False):
     diagnostics: Dict[str, Any]
 
     shadow_compare: Optional[Dict[str, Any]]
+
+    # M9 — reel-scoped narrative memory. See `ReelNarrativeState`
+    # above. Hydrated by `narrative_state.load_reel_narrative_state`
+    # at turn start; mirrored to Convex by
+    # `narrative_state.persist_reel_narrative_state` at turn exit.
+    reel_narrative_state: ReelNarrativeState

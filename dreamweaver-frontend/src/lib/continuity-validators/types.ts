@@ -6,7 +6,9 @@ export type ValidatorCode =
   | "SHOT_AXIS_LINE_BREAK"
   | "SHOT_SCREEN_DIRECTION_REVERSE"
   | "SHOT_THIRTY_DEGREE_RULE"
-  | "SHOT_EYELINE_MISMATCH";
+  | "SHOT_EYELINE_MISMATCH"
+  | "SHOT_SPEAKER_VOICE_MISSING"
+  | "SHOT_SPEAKER_VOICE_MISMATCH";
 
 /**
  * Code prefixes owned by the shot-validator family. The mutation that
@@ -21,6 +23,8 @@ export const SHOT_VALIDATOR_CODE_PREFIXES: readonly string[] = [
   "SHOT_SCREEN_DIRECTION_REVERSE",
   "SHOT_THIRTY_DEGREE_RULE",
   "SHOT_EYELINE_MISMATCH",
+  "SHOT_SPEAKER_VOICE_MISSING",
+  "SHOT_SPEAKER_VOICE_MISMATCH",
 ] as const;
 
 export interface ValidatorNode {
@@ -34,6 +38,20 @@ export interface ValidatorNode {
     sceneId?: string;
     shotId?: string;
   };
+  /** M6 Voice #5 — raw shot segment text. Used by the voice-coverage
+   *  validator to extract uppercase speaker names and flag ones whose
+   *  identity pack has no TTS voice mapped. Optional so non-voice
+   *  validators don't pay the extra payload. */
+  segment?: string;
+}
+
+/** M6 Voice #5 — subset of the identityPack shape the voice-coverage
+ *  validator needs. Intentionally loose so the caller can pass the raw
+ *  Convex row without a conversion step. */
+export interface ValidatorIdentityPack {
+  name?: string;
+  sourceCharacterId?: string;
+  voice?: string;
 }
 
 export interface ValidatorEdge {
@@ -47,6 +65,10 @@ export interface ValidatorEdge {
 export interface ValidatorInput {
   nodes: ValidatorNode[];
   edges: ValidatorEdge[];
+  /** M6 Voice #5 — identity packs used only by the voice-coverage
+   *  validator. Optional so legacy callers that don't yet thread
+   *  packs still work (voice-coverage becomes a no-op). */
+  identityPacks?: ValidatorIdentityPack[];
 }
 
 export interface ValidatorViolation {

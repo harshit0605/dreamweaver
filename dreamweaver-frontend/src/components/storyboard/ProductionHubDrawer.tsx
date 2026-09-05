@@ -9,6 +9,8 @@ import type {
   ConstraintBundle,
   NarrativeBranchRecord,
   NarrativeCommitRecord,
+  NarrativeMotifRecord,
+  NarrativeVariantRecord,
   QuotaUsageSummary,
   RuntimeResolvedTeam,
   SimulationCriticRunRecord,
@@ -125,6 +127,25 @@ export function ProductionHubDrawer(props: {
     }) => Promise<void>;
     removePortrait: (input: { referenceId: string }) => Promise<void>;
   };
+
+  // M9 Phase 3 — variant compare passthrough to TimelineTheaterPanel.
+  variants?: NarrativeVariantRecord[];
+  compareBranchIds?: string[];
+  onToggleCompareBranch?: (branchId: string) => void;
+  onPromoteVariant?: (variant: NarrativeVariantRecord) => Promise<void>;
+  // M9 Phase 4 — motif map passthrough. onFocusNode hops a click
+  // on a motif's node-chip back up to the canvas.
+  motifs?: NarrativeMotifRecord[];
+  onFocusNode?: (nodeId: string) => void;
+  // M9 Phase 5 — manual motif plant passthrough.
+  shotNodes?: import("@/app/storyboard/types").StoryNode[];
+  onPlantMotif?: (input: {
+    motifKey: string;
+    description: string;
+    targetNodeId: string;
+    role: "plant" | "payoff";
+    visualVocabulary?: string;
+  }) => Promise<void>;
 }) {
   const {
     pendingApprovalsCount,
@@ -265,6 +286,14 @@ export function ProductionHubDrawer(props: {
                       onSetBranchCutTier={props.onSetBranchCutTier}
                       onSetCommitReviewRound={props.onSetCommitReviewRound}
                       onBumpBranchHeadReviewRound={props.onBumpBranchHeadReviewRound}
+                      variants={props.variants}
+                      compareBranchIds={props.compareBranchIds}
+                      onToggleCompareBranch={props.onToggleCompareBranch}
+                      onPromoteVariant={props.onPromoteVariant}
+                      motifs={props.motifs}
+                      onFocusNode={props.onFocusNode}
+                      shotNodes={props.shotNodes}
+                      onPlantMotif={props.onPlantMotif}
                     />
                     <SimulationCriticPanel
                       simulationRuns={simulationRuns}

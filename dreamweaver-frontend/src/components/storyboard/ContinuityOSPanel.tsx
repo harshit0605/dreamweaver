@@ -1,7 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useQuery } from "convex/react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+
+interface VoiceCloneRow {
+  _id: string;
+  name: string;
+  description: string | null;
+  elevenlabsVoiceId: string;
+  previewUrl: string | null;
+  locale: string | null;
+}
 
 import type { ConstraintBundle, IdentityReferenceRecord, PortraitView } from "@/app/storyboard/types";
 import {
@@ -9,7 +18,15 @@ import {
   PORTRAIT_VIEW_OPTIONS,
   portraitSetStatus,
 } from "@/lib/identity-portraits";
-import { queryRef } from "@/lib/convexRefs";
+import { mutationRef, queryRef } from "@/lib/convexRefs";
+import {
+  parseVoiceCast,
+  planVoiceCastImport,
+  serializeVoiceCast,
+  stringifyVoiceCast,
+  suggestVoiceCast,
+  type MatchablePack,
+} from "@/lib/voice-cast-io";
 
 type ViolationStatus = "acknowledged" | "resolved";
 
@@ -181,22 +198,304 @@ function IdentityPacksView({
   storyboardId?: string;
   identityPortraitCallbacks?: IdentityPortraitCallbacks;
 }) {
+  // Voice clones are producer-scoped (not per-storyboard), so we fetch
+  // them once here and pass the list down to every row. Skipped when
+  // storyboardId is missing because the rows won't render their clone
+  // picker in that case anyway.
+  const voiceClones = useQuery(
+    queryRef("voiceClones:listVoiceClones"),
+    storyboardId ? {} : "skip",
+  ) as VoiceCloneRow[] | undefined;
+  const setPackVoiceClone = useMutation(
+    mutationRef("voiceClones:setPackVoiceClone"),
+  );
+  const handleSetPackVoiceClone = useMemo(
+    () =>
+      async (packId: string, voiceCloneId: string | null) => {
+        if (!storyboardId) return;
+        await setPackVoiceClone({
+          storyboardId: storyboardId as never,
+          packId,
+          voiceCloneId:
+            voiceCloneId === null ? null : (voiceCloneId as never),
+        });
+      },
+    [setPackVoiceClone, storyboardId],
+  );
+
   if (packs.length === 0) {
     return <p className="text-[11px] text-zinc-500">No identity packs yet.</p>;
   }
   return (
     <>
+      {onSetIdentityPackVoice ? (
+        <VoiceCastIO
+          packs={packs}
+          onSetIdentityPackVoice={onSetIdentityPackVoice}
+        />
+      ) : null}
       {packs.slice(0, 12).map((pack, index) => (
         <IdentityPackRow
           key={asString(pack.packId, `pack_${index}`)}
           pack={pack}
           onPublishIdentityPack={onPublishIdentityPack}
           onSetIdentityPackVoice={onSetIdentityPackVoice}
+          voiceClones={voiceClones}
+          onSetPackVoiceClone={
+            storyboardId ? handleSetPackVoiceClone : undefined
+          }
           storyboardId={storyboardId}
           identityPortraitCallbacks={identityPortraitCallbacks}
         />
       ))}
     </>
+  );
+}
+
+/**
+ * M6 Voice #3 — export / import the voice cast as JSON so producers can
+ * transplant assignments between storyboards. Export copies the current
+ * `{ packName, sourceCharacterId?, voice }` list to the clipboard;
+ * import accepts a pasted JSON payload and applies each entry via
+ * onSetIdentityPackVoice after matching packs by sourceCharacterId or
+ * name (case-insensitive).
+ *
+ * Intentionally light on polish — a producer tool, not an end-user
+ * feature. Inline textarea + status line. Hidden entirely when the
+ * caller didn't provide `onSetIdentityPackVoice`.
+ */
+function VoiceCastIO({
+  packs,
+  onSetIdentityPackVoice,
+}: {
+  packs: Array<Record<string, unknown>>;
+  onSetIdentityPackVoice: (packId: string, voice: string) => Promise<void>;
+}) {
+  const [mode, setMode] = useState<"idle" | "import">("idle");
+  const [text, setText] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const [statusTone, setStatusTone] = useState<
+    "info" | "error" | "success"
+  >("info");
+  const [busy, setBusy] = useState(false);
+
+  const castCount = useMemo(() => {
+    const payload = serializeVoiceCast(
+      packs.map((p) => ({
+        name: p.name,
+        sourceCharacterId: p.sourceCharacterId,
+        voice: p.voice,
+      })),
+    );
+    return payload.entries.length;
+  }, [packs]);
+
+  const matchablePacks: MatchablePack[] = useMemo(
+    () =>
+      packs
+        .map((p) => ({
+          packId: asString(p.packId),
+          name: asString(p.name),
+          sourceCharacterId: asString(p.sourceCharacterId),
+        }))
+        .filter((p) => p.packId.length > 0),
+    [packs],
+  );
+
+  const handleAutoSuggest = async () => {
+    setStatus(null);
+    setStatusTone("info");
+    try {
+      const payload = await suggestVoiceCast(
+        packs.map((p) => ({
+          name: asString(p.name),
+          sourceCharacterId: asString(p.sourceCharacterId),
+          voice: asString(p.voice),
+          dnaJson: asString(p.dnaJson),
+        })),
+      );
+      if (payload.entries.length === 0) {
+        setStatusTone("info");
+        setStatus(
+          "No suggestions — every pack already has a voice. Use Import with overwrite if you want to regenerate.",
+        );
+        return;
+      }
+      // Populate the Import textarea with the proposed JSON so the
+      // existing import flow handles preview + Apply. Producers audit
+      // before committing — no silent overwrites.
+      setMode("import");
+      setText(stringifyVoiceCast(payload));
+      setStatusTone("success");
+      setStatus(
+        `Drafted ${payload.entries.length} suggestion${payload.entries.length === 1 ? "" : "s"} — review and Apply to commit.`,
+      );
+    } catch (err) {
+      setStatusTone("error");
+      setStatus(
+        err instanceof Error ? err.message : "Auto-suggest failed unexpectedly.",
+      );
+    }
+  };
+
+  const handleExport = async () => {
+    setStatus(null);
+    setStatusTone("info");
+    try {
+      const payload = serializeVoiceCast(
+        packs.map((p) => ({
+          name: p.name,
+          sourceCharacterId: p.sourceCharacterId,
+          voice: p.voice,
+        })),
+      );
+      const json = stringifyVoiceCast(payload);
+      if (
+        typeof navigator !== "undefined" &&
+        navigator.clipboard?.writeText
+      ) {
+        await navigator.clipboard.writeText(json);
+        setStatusTone("success");
+        setStatus(
+          `Copied ${payload.entries.length} voice assignment${payload.entries.length === 1 ? "" : "s"} to clipboard.`,
+        );
+      } else {
+        // Fallback: surface the JSON in the textarea so the producer
+        // can manually copy it. Covers old browsers + non-HTTPS dev.
+        setMode("import");
+        setText(json);
+        setStatusTone("info");
+        setStatus(
+          "Clipboard unavailable — JSON rendered inline; copy manually.",
+        );
+      }
+    } catch (err) {
+      setStatusTone("error");
+      setStatus(
+        err instanceof Error ? err.message : "Export failed unexpectedly.",
+      );
+    }
+  };
+
+  const handleImport = async () => {
+    setBusy(true);
+    setStatus(null);
+    setStatusTone("info");
+    try {
+      const parsed = parseVoiceCast(text);
+      if (parsed.error || !parsed.payload) {
+        setStatusTone("error");
+        setStatus(`Import failed: ${parsed.error ?? "invalid payload"}`);
+        return;
+      }
+      const plan = planVoiceCastImport(parsed.payload.entries, matchablePacks);
+      if (plan.matches.length === 0) {
+        setStatusTone("error");
+        setStatus(
+          `No matching packs for any of the ${parsed.payload.entries.length} entr${parsed.payload.entries.length === 1 ? "y" : "ies"}.`,
+        );
+        return;
+      }
+      let applied = 0;
+      let failed = 0;
+      for (const match of plan.matches) {
+        try {
+          await onSetIdentityPackVoice(match.packId, match.entry.voice);
+          applied += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      const pieces: string[] = [];
+      pieces.push(`Applied ${applied}/${plan.matches.length} voice${plan.matches.length === 1 ? "" : "s"}`);
+      if (failed > 0) pieces.push(`${failed} failed`);
+      if (plan.unmatched.length > 0)
+        pieces.push(`${plan.unmatched.length} unmatched`);
+      if (parsed.droppedCount > 0)
+        pieces.push(`${parsed.droppedCount} dropped (invalid entries)`);
+      setStatusTone(failed > 0 ? "error" : "success");
+      setStatus(pieces.join(" · "));
+      if (failed === 0 && plan.unmatched.length === 0) {
+        setMode("idle");
+        setText("");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const statusClass =
+    statusTone === "error"
+      ? "text-rose-400"
+      : statusTone === "success"
+        ? "text-emerald-400"
+        : "text-zinc-400";
+
+  return (
+    <div className="rounded border border-zinc-800 bg-zinc-900/40 p-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className="text-[10px] uppercase tracking-wide text-zinc-500"
+          title="JSON round-trip for moving a cast between storyboards"
+        >
+          Voice cast
+        </span>
+        <button
+          type="button"
+          onClick={() => void handleExport()}
+          disabled={castCount === 0}
+          className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[10px] text-zinc-200 disabled:opacity-40"
+          title={
+            castCount === 0
+              ? "No packs have a voice assigned yet"
+              : `Copy ${castCount} assignment${castCount === 1 ? "" : "s"} as JSON`
+          }
+        >
+          Export ({castCount})
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleAutoSuggest()}
+          className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[10px] text-zinc-200"
+          title="Propose voices for un-cast packs based on identity DNA"
+        >
+          Auto-suggest
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setMode((prev) => (prev === "import" ? "idle" : "import"));
+            setStatus(null);
+          }}
+          className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[10px] text-zinc-200"
+        >
+          {mode === "import" ? "Cancel" : "Import…"}
+        </button>
+        {status ? (
+          <span className={`text-[10px] ${statusClass}`}>{status}</span>
+        ) : null}
+      </div>
+      {mode === "import" ? (
+        <div className="mt-2 space-y-2">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder='Paste voice-cast JSON here — either the full { kind: "voice-cast", entries: [...] } envelope or a bare [{ name, voice, sourceCharacterId? }, ...] array.'
+            className="h-24 w-full resize-y rounded border border-zinc-700 bg-zinc-950 p-2 text-[10px] text-zinc-200"
+          />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleImport()}
+              disabled={busy || text.trim().length === 0}
+              className="rounded bg-emerald-700/70 px-2 py-0.5 text-[10px] text-zinc-100 disabled:opacity-40"
+            >
+              {busy ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -216,12 +515,22 @@ function IdentityPackRow({
   pack,
   onPublishIdentityPack,
   onSetIdentityPackVoice,
+  voiceClones,
+  onSetPackVoiceClone,
   storyboardId,
   identityPortraitCallbacks,
 }: {
   pack: Record<string, unknown>;
   onPublishIdentityPack?: (packId: string, publish: boolean) => Promise<void>;
   onSetIdentityPackVoice?: (packId: string, voice: string) => Promise<void>;
+  /** M8 — producer's voice clones, fetched once by the parent. */
+  voiceClones?: VoiceCloneRow[];
+  /** M8 — attach / detach a clone to this pack. `voiceCloneId` of
+   *  null clears the mapping. */
+  onSetPackVoiceClone?: (
+    packId: string,
+    voiceCloneId: string | null,
+  ) => Promise<void>;
   storyboardId?: string;
   identityPortraitCallbacks?: IdentityPortraitCallbacks;
 }) {
@@ -233,11 +542,19 @@ function IdentityPackRow({
   const published = asBool(pack.published);
   const sourceCharacterId = asString(pack.sourceCharacterId);
   const voice = asString(pack.voice);
+  const voiceCloneId = asString(pack.voiceCloneId);
   const dnaJson = asString(pack.dnaJson);
   const [expanded, setExpanded] = useState(false);
   const [portraitsExpanded, setPortraitsExpanded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
+  const [cloneBusy, setCloneBusy] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // Single audio element per row — we swap its src each preview so
+  // clicking a second preview interrupts the first instead of layering
+  // two voices on top of each other.
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const dnaPreview = useMemo(() => {
     if (!dnaJson) return "";
@@ -268,6 +585,72 @@ function IdentityPackRow({
     }
   };
 
+  const handleCloneChange = async (next: string) => {
+    if (!onSetPackVoiceClone || !packId) return;
+    setCloneBusy(true);
+    try {
+      await onSetPackVoiceClone(packId, next.length > 0 ? next : null);
+    } finally {
+      setCloneBusy(false);
+    }
+  };
+
+  const playVoicePreview = async () => {
+    // Nothing to audition when the pack is on the default voice — the
+    // button is disabled in that state, but guard anyway for safety.
+    if (!voice || previewBusy) return;
+    setPreviewError(null);
+    setPreviewBusy(true);
+    try {
+      const res = await fetch(
+        `/api/media/preview-voice?voice=${encodeURIComponent(voice)}`,
+        { method: "GET", cache: "no-store" },
+      );
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "");
+        throw new Error(
+          `preview ${res.status}: ${msg.slice(0, 160) || "unknown error"}`,
+        );
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      // Reuse the same <audio> across clicks so a second preview
+      // interrupts the first. Revoke the previous object URL to let
+      // the browser GC the bytes.
+      const prev = previewAudioRef.current;
+      if (prev) {
+        prev.pause();
+        const prevSrc = prev.src;
+        if (prevSrc.startsWith("blob:")) {
+          URL.revokeObjectURL(prevSrc);
+        }
+      }
+      const audio = prev ?? new Audio();
+      previewAudioRef.current = audio;
+      audio.src = url;
+      await audio.play();
+    } catch (err) {
+      setPreviewError(
+        err instanceof Error ? err.message : "voice preview failed",
+      );
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  // Release the last object URL when the row unmounts. Skipping this
+  // leaks a mp3-sized Blob per audition until the next full page reload.
+  useEffect(() => {
+    return () => {
+      const audio = previewAudioRef.current;
+      if (!audio) return;
+      audio.pause();
+      if (audio.src.startsWith("blob:")) {
+        URL.revokeObjectURL(audio.src);
+      }
+    };
+  }, []);
+
   return (
     <div className="rounded border border-zinc-800 p-2">
       <div className="flex items-start justify-between gap-2">
@@ -284,24 +667,68 @@ function IdentityPackRow({
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {onSetIdentityPackVoice && packId ? (
-            <label
-              className="flex items-center gap-1 text-[10px] text-zinc-400"
-              title="OpenAI TTS voice the audio batch uses when this character is the detected speaker"
-            >
-              <span className="uppercase tracking-wide">Voice</span>
-              <select
-                value={voice}
-                onChange={(e) => void handleVoiceChange(e.target.value)}
-                disabled={voiceBusy}
-                className="rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-[10px] text-zinc-200 disabled:opacity-50"
+            <div className="flex items-center gap-1">
+              <label
+                className="flex items-center gap-1 text-[10px] text-zinc-400"
+                title="OpenAI TTS voice the audio batch uses when this character is the detected speaker"
               >
-                {VOICE_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+                <span className="uppercase tracking-wide">Voice</span>
+                <select
+                  value={voice}
+                  onChange={(e) => void handleVoiceChange(e.target.value)}
+                  disabled={voiceBusy}
+                  className="rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-[10px] text-zinc-200 disabled:opacity-50"
+                >
+                  {VOICE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => void playVoicePreview()}
+                disabled={!voice || previewBusy}
+                title={
+                  voice
+                    ? `Play a short sample of the "${voice}" voice`
+                    : "Select a voice to enable preview"
+                }
+                className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-200 disabled:opacity-40"
+              >
+                {previewBusy ? "…" : "▶"}
+              </button>
+              {/* M8 — voice clone picker. When a clone is attached,
+                  the audio batch routes this character's lines
+                  through ElevenLabs. Hidden when the producer has no
+                  clones yet (zero-config install stays clean). */}
+              {onSetPackVoiceClone && voiceClones && voiceClones.length > 0 ? (
+                <label
+                  className="flex items-center gap-1 text-[10px] text-zinc-400"
+                  title={
+                    voiceCloneId
+                      ? "Clone override: this character will speak with the cloned voice (ElevenLabs)."
+                      : "No clone attached — routes through OpenAI preset."
+                  }
+                >
+                  <span className="uppercase tracking-wide">Clone</span>
+                  <select
+                    value={voiceCloneId}
+                    onChange={(e) => void handleCloneChange(e.target.value)}
+                    disabled={cloneBusy}
+                    className="max-w-[120px] rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-[10px] text-zinc-200 disabled:opacity-50"
+                  >
+                    <option value="">(none)</option>
+                    {voiceClones.map((clone) => (
+                      <option key={clone._id} value={clone._id}>
+                        {clone.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+            </div>
           ) : null}
           {onPublishIdentityPack && packId ? (
             <button
@@ -315,6 +742,11 @@ function IdentityPackRow({
           ) : null}
         </div>
       </div>
+      {previewError ? (
+        <p className="mt-1 text-[10px] text-rose-400" title={previewError}>
+          preview failed: {previewError}
+        </p>
+      ) : null}
       {dnaPreview ? (
         <button
           type="button"

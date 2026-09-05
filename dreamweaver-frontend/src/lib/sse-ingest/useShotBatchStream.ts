@@ -48,8 +48,9 @@ const INITIAL_STATE: ShotBatchState = {
 /** Which media surface the batch should target. Image renders shot
  *  stills via LTX-2.3/Zennah (fast path); video renders per-shot I2V
  *  clips via LTX-2.3 with the shot's existing image as keyframe 0;
- *  audio runs OpenAI TTS over each shot's narration text. */
-export type ShotBatchMode = "image" | "video" | "audio";
+ *  audio runs OpenAI TTS over each shot's narration text; sfx
+ *  generates per-shot ambient/foley via ElevenLabs Sound Effects. */
+export type ShotBatchMode = "image" | "video" | "audio" | "sfx";
 
 export interface StartShotBatchInput {
   storyboardId: string;
@@ -67,6 +68,12 @@ export interface StartShotBatchInput {
   model?: string;
   /** TTS speed override, only consumed in `mode: "audio"`. */
   speed?: number;
+  /** M8 — target locale for multi-language narration. Only consumed
+   *  in `mode: "audio"`. Empty / "en" / "en-*" runs the original
+   *  source-language path; any other value translates each shot's
+   *  narration before TTS and persists the dub into
+   *  `localeNarrations` instead of as the shot's active audio. */
+  locale?: string;
   /** Only consumed in `mode: "image"` — re-render only shots whose
    *  active image is flagged NG (dailies review loop). */
   flaggedOnly?: boolean;
@@ -119,7 +126,9 @@ export function useShotBatchStream() {
             ? "/api/storyboard/generate-shot-videos-stream"
             : mode === "audio"
               ? "/api/storyboard/generate-shot-audios-stream"
-              : "/api/storyboard/generate-shots-stream";
+              : mode === "sfx"
+                ? "/api/storyboard/generate-shot-sfxs-stream"
+                : "/api/storyboard/generate-shots-stream";
         // Strip `mode` from the body — the endpoint itself encodes the
         // media kind. Each mode forwards only the params its route
         // knows how to interpret.
@@ -140,14 +149,21 @@ export function useShotBatchStream() {
                   voice: rest.voice,
                   model: rest.model,
                   speed: rest.speed,
+                  locale: rest.locale,
                 }
-              : {
-                  storyboardId: rest.storyboardId,
-                  skipExisting: rest.skipExisting,
-                  concurrency: rest.concurrency,
-                  flaggedOnly: rest.flaggedOnly,
-                  nodeIds: rest.nodeIds,
-                };
+              : mode === "sfx"
+                ? {
+                    storyboardId: rest.storyboardId,
+                    skipExisting: rest.skipExisting,
+                    concurrency: rest.concurrency,
+                  }
+                : {
+                    storyboardId: rest.storyboardId,
+                    skipExisting: rest.skipExisting,
+                    concurrency: rest.concurrency,
+                    flaggedOnly: rest.flaggedOnly,
+                    nodeIds: rest.nodeIds,
+                  };
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },

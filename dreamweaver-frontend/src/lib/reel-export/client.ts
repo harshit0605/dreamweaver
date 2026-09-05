@@ -34,11 +34,28 @@ export interface ClientExportProgress {
   message?: string;
 }
 
+/** Minimal shape we need from the ffmpeg.wasm FFmpeg instance. Typing
+ *  against a narrow interface instead of the @ffmpeg/ffmpeg class makes
+ *  the orchestration unit-testable under bun without loading a real
+ *  ffmpeg-core wasm binary. */
+export interface FfmpegLike {
+  writeFile(name: string, data: Uint8Array): Promise<unknown>;
+  readFile(name: string): Promise<Uint8Array | string>;
+  deleteFile(name: string): Promise<unknown>;
+  exec(args: string[]): Promise<number>;
+}
+
 export interface ClientExportOptions {
   manifest: ReelManifest;
   /** Invoked on every stage/progress transition so the UI can show a
    *  spinner + current shot index. */
   onProgress?: (progress: ClientExportProgress) => void;
+  /** Dependency-injected ffmpeg loader. Default loads the real
+   *  ffmpeg.wasm bundle from unpkg; tests override with a stub. */
+  ffmpegFactory?: () => Promise<FfmpegLike>;
+  /** Dependency-injected fetcher for asset URLs. Default is `fetch`.
+   *  Tests override to avoid real network calls. */
+  fetchBytes?: (url: string) => Promise<Uint8Array>;
 }
 
 export interface ClientExportResult {
@@ -194,11 +211,12 @@ export const buildClientConcatListText = (shotNames: string[]): string =>
 export const exportReelClientSide = async (
   options: ClientExportOptions,
 ): Promise<ClientExportResult> => {
-  const { manifest, onProgress } = options;
+  const { manifest, onProgress, ffmpegFactory, fetchBytes } = options;
   const emit = (update: ClientExportProgress) => onProgress?.(update);
+  const fetchImpl = fetchBytes ?? fetchToBytes;
 
   emit({ stage: "loading_wasm" });
-  const ffmpeg = await loadFfmpeg();
+  const ffmpeg: FfmpegLike = await (ffmpegFactory ?? loadFfmpeg)();
 
   const shotCount = manifest.shots.length;
   const normalizedNames: string[] = [];
@@ -212,16 +230,21 @@ export const exportReelClientSide = async (
     let audioName: string | null = null;
     if (shot.videoUrl) {
       videoName = `shot_${i}.src.mp4`;
-      await ffmpeg.writeFile(videoName, await fetchToBytes(shot.videoUrl));
+      await ffmpeg.writeFile(videoName, await fetchImpl(shot.videoUrl));
     }
     if (!shot.videoUrl && shot.imageUrl) {
       imageName = `shot_${i}.src.png`;
-      await ffmpeg.writeFile(imageName, await fetchToBytes(shot.imageUrl));
+      await ffmpeg.writeFile(imageName, await fetchImpl(shot.imageUrl));
     }
     if (shot.audioUrl) {
       audioName = `shot_${i}.src.mp3`;
-      await ffmpeg.writeFile(audioName, await fetchToBytes(shot.audioUrl));
+      await ffmpeg.writeFile(audioName, await fetchImpl(shot.audioUrl));
     }
+    // M7 note: SFX ambient track is dropped on the wasm path for now.
+    // The server ffmpeg path pre-mixes SFX + narration before
+    // normalizing (see generate-shot-sfxs + export-reel route). Adding
+    // the same amix graph here is tractable but would require another
+    // per-shot filter_complex pass; deferred until producer demand.
 
     emit({ stage: "normalizing", shotIndex: i, shotTotal: shotCount });
     const outputName = `shot_${i}.mp4`;
