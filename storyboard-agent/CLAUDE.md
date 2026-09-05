@@ -75,7 +75,7 @@ Graphs are cached in `_GRAPH_CACHE`, keyed by (enabled members, allowlist). Chan
 |---|---|
 | `factory.py` | `create_storyboard_deep_agent_graph(enabled_member_names, tool_allowlist)`. Supervisor model from `STORYBOARD_AGENT_MODEL` (**default `openai:gpt-4.1-mini`**). Checkpointer: Postgres if `STORYBOARD_CHECKPOINT_POSTGRES_URI` is set, else in-memory. `_interrupt_config()` declares allowed HITL decisions per tool. |
 | `subagents.py` | 9 subagents: `planner`, `continuity_critic`, `simulation_critic`, `dailies_producer`, `visual_director`, `producer_guard`, `team_architect`, `ingestion_coordinator`, `repair_agent`. Filtered by the team's enabled members. |
-| `state.py` | `TypedDict`s for the wire contract: `PlanOperation`, `DryRunReport`, `SemanticDiff`, `ExecutionPlan`, `AutonomousDailiesReel`, `SimulationCriticRun`, `DelegationRecord`, `TeamRuntimeConfig`, `StoryboardDeepAgentState`. These mirror `frontend/src/app/storyboard/types.ts` — change one, change both. |
+| `state.py` | `TypedDict`s for the wire contract: `PlanOperation`, `DryRunReport`, `SemanticDiff`, `ExecutionPlan`, `AutonomousDailiesReel`, `SimulationCriticRun`, `DelegationRecord`, `TeamRuntimeConfig`, `StoryboardDeepAgentState`. These mirror `dreamweaver-frontend/src/app/storyboard/types.ts` — change one, change both. |
 | `tools.py` (1255) | Every `@tool`, plus the allowlist machinery. |
 
 `deep/__init__.py` degrades gracefully: if DeepAgents deps are missing, `create_storyboard_deep_agent_graph` raises a clear `RuntimeError` instead of an import error at module load. Preserve that.
@@ -134,7 +134,7 @@ novel     → novel_compressor → episode_splitter → novel_ingester ─┘
                               storyboard_artist → mapper → Convex-shaped nodes/edges
 ```
 
-- **`types.py` is the cross-language contract.** Fields are **camelCase on purpose** so payloads forward into Convex `bulkCreateNodes` / `bulkCreateEdges` with no remapping. Don't snake_case them. It mirrors `frontend/src/app/storyboard/types.ts`.
+- **`types.py` is the cross-language contract.** Fields are **camelCase on purpose** so payloads forward into Convex `bulkCreateNodes` / `bulkCreateEdges` with no remapping. Don't snake_case them. It mirrors `dreamweaver-frontend/src/app/storyboard/types.ts`.
 - **`llm_factory.py`** — OpenAI, default **`gpt-5.4`**, override `VIMAX_PORT_LLM_MODEL`. Chosen for structured-output reliability; the pipeline leans on deeply nested Pydantic schemas. Note this is a *different* model from the supervisor's `STORYBOARD_AGENT_MODEL`.
 - **`mapper.py`** — descriptions → `ShotMeta` (size/angle/lens/move/aspect) and node/edge ids. Well covered by `tests/test_mapper.py` (467 lines); extend those when you change heuristics.
 

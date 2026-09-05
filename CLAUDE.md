@@ -2,7 +2,7 @@
 
 AI film pre-production. Idea / screenplay / novel → narrative graph (scenes → shots) → character-consistent shot images → image-to-video → TTS narration → exportable reel.
 
-**Deep reference: [`AI.md`](./AI.md)** — full inventory (37 Convex tables, every endpoint, every lib, milestone history). Read it when you need breadth. This file is the operating manual.
+**Deep reference: [`AI.md`](./AI.md)** — full inventory (44 Convex tables, every endpoint, every lib, milestone history). Read it when you need breadth. This file is the operating manual.
 
 Per-area guides load automatically when you work in them:
 `dreamweaver-frontend/CLAUDE.md` · `dreamweaver-frontend/convex/CLAUDE.md` · `dreamweaver-backend/CLAUDE.md` · `storyboard-agent/CLAUDE.md`
@@ -41,10 +41,10 @@ storyboard-agent/deep/tools.py       @tool def approve_x(...)             ← th
 storyboard-agent/deep/factory.py     _interrupt_config()                  ← allowed decisions
 storyboard-agent/agent.py            _ACTION_POLICY_TOKENS["approve_x"]   ← or it bypasses the allowlist
   ↓
-frontend/src/components/storyboard/StoryboardCopilotBridge.tsx
+dreamweaver-frontend/src/components/storyboard/StoryboardCopilotBridge.tsx
                                      useCopilotAction({ name: "approve_x" })  ← render + accept/reject
   ↓
-frontend/src/app/storyboard/agentExecutionAdapter.ts
+dreamweaver-frontend/src/app/storyboard/agentExecutionAdapter.ts
                                      executeApproved* / executeRejected*      ← the mutation
 ```
 
@@ -101,6 +101,9 @@ Requires three gitignored env files: `dreamweaver-backend/.env`, `dreamweaver-fr
 ```bash
 cd dreamweaver-frontend && bun test && bun run lint     # ~50 test files
 cd storyboard-agent     && uv run pytest               # tests/ + viMax_port/tests/
+
+# Playwright e2e (needs services running; `bun run test:e2e:install` once)
+cd dreamweaver-frontend && bun run test:e2e
 ```
 
 `dreamweaver-backend` has **no automated tests** — `scripts/test_*.py` are manual scripts that call live APIs and write to `test_outputs/`. Don't run them expecting a test suite, and don't cite them as passing tests.

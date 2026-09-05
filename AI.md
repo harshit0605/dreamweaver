@@ -66,7 +66,7 @@ dreamweaver/
                           ▼           ▼              ▼
           ┌───────────────────┐  ┌──────────────┐  ┌──────────────────┐
           │ storyboard-agent  │  │ dreamweaver- │  │ Convex           │
-          │ (LangGraph 8123)  │  │ backend 8001 │  │ (37 tables)      │
+          │ (LangGraph 8123)  │  │ backend 8001 │  │ (44 tables)      │
           │ graph: storyboard_│  │ FastAPI      │  │ + Better Auth    │
           │ agent + /script-  │  │ image/video/ │  │ source of truth  │
           │ ingest* routes    │  │ consistency  │  └──────────────────┘
@@ -133,7 +133,7 @@ Rollout control: `AGENT_ROLLOUT_PERCENT` (0-100) with a stable hash bucket on `s
 Endpoints:
 - `GET  /api/models?type=image|video|edit`
 - `POST /api/image/generate`, `/api/image/edit`, `/api/image/compose` (multi-reference), `POST /api/image/build-prompt`, `GET /api/image/models`
-- `POST /api/video/generate`, `/api/video/retake`
+- `POST /api/video/generate`, `/api/video/retake` — **router is mounted but no video provider is registered** (see rough edges); calls fail `PROVIDER_NOT_FOUND`.
 - `POST /api/consistency/evaluate` — identity/wardrobe continuity scoring
 - `GET /`, `GET /health`
 
@@ -164,7 +164,7 @@ CORS is a hardcoded localhost:3000-3005 list + `https://dreamweaver-s6j9.vercel.
 
 `src/server/vault/adapter.ts` — resolves provider secrets via Convex `secretHandles` (`resolveSecretByHandleId`, `resolveSecretByProviderScope`), with env fallback.
 
-### Convex (`dreamweaver-frontend/convex/`, 37 tables)
+### Convex (`dreamweaver-frontend/convex/`, 44 tables)
 Domain groups:
 - **Graph**: `storyboards`, `storyboardNodes`, `storyboardEdges`, `scenes`, `shots`, `storyEvents`, `nodeHistoryContexts`
 - **Entities/continuity**: `characters`, `wardrobeVariants`, `backgrounds`, `identityPacks`, `identityReferenceAssets`, `globalConstraints`, `continuityViolations`
@@ -276,5 +276,6 @@ Also landed: Postgres checkpointer lifecycle + docker-compose (`storyboard-agent
 - Backend README says port 8000; `.claude/launch.json` and the launcher scripts use 8001.
 - Backend `scripts/` are manual test scripts, not an automated suite — there is no pytest config for `dreamweaver-backend`.
 - Backend CORS origins are hardcoded in `main.py` (localhost 3000-3005 + one Vercel domain).
-- No root-level README, CLAUDE.md, or CI config.
+- `providers/registry.py` defines `register_video_provider` but never calls it — `initialize_providers()` registers image providers only, so `/api/video/*` is unreachable despite `providers/{modal,google}/video.py` existing.
+- No root-level README. (CI lives in `.github/workflows/`: `ci-pr`, `nightly-llm-smoke`, `pre-release-e2e`.)
 - `convex/_debugAuth.ts` exposes dev-only auth probes (`probeAuthSignUp`, `resetPasswordDev`) — should not be reachable in prod.

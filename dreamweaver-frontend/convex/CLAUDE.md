@@ -1,6 +1,6 @@
 # CLAUDE.md — convex/
 
-Source of truth for Dreamweaver. 37 tables, ~11k LOC of functions, Better Auth via `@convex-dev/better-auth`.
+Source of truth for Dreamweaver. 44 tables, ~11k LOC of functions, Better Auth via `@convex-dev/better-auth`.
 
 Separate from the Next.js app in ways that matter: it's a different runtime, it has its own auth model, and the app `tsconfig.json` **excludes this directory** — so `bun run build` passing tells you nothing about whether these files typecheck.
 
